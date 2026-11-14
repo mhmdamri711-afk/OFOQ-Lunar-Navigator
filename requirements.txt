@@ -1,6 +1,9 @@
 streamlit
 streamlit-folium
 folium
-pandas
-plotly
 requests
+pandas
+numpy
+plotly
+rasterio
+pyproj
