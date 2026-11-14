@@ -5,5 +5,4 @@ requests
 pandas
 numpy
 plotly
-rasterio
-pyproj
+tifffile
