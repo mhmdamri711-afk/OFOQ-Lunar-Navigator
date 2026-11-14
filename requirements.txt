@@ -1,8 +1,10 @@
-streamlit
-streamlit-folium
-folium
+streamlit>=1.49
+streamlit-image-coordinates
 requests
-pandas
 numpy
+pandas
 plotly
+Pillow
+rasterio
+pyproj
 tifffile
