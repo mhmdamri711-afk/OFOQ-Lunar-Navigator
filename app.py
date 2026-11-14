@@ -1,949 +1,1301 @@
 import streamlit as st
 import streamlit.components.v1 as components
-from streamlit_folium import st_folium
-import folium
-import pandas as pd
-import numpy as np
+
 import requests
+import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
+import rasterio
 import tifffile
 
+from PIL import Image, ImageDraw
 from io import BytesIO
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, timedelta
+from pyproj import CRS, Transformer
+from rasterio.windows import Window
+from rasterio.enums import Resampling
+from streamlit_image_coordinates import streamlit_image_coordinates
+
 import base64
 import json
 
-# =====================================================
-# OFOQ v4 | LUNAR MISSION EXPLORER
-# =====================================================
+
+# ==================================================
+# OFOQ V5 | LUNAR MISSION EXPERIENCE
+# ==================================================
 
 st.set_page_config(
-    page_title="OFOQ | Lunar Mission Explorer",
+    page_title="OFOQ | أُفُق",
     page_icon="🌙",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
-API = "https://ssd.jpl.nasa.gov/api/horizons.api"
-
-BASE = (
-    "https://svs.gsfc.nasa.gov/vis/"
-    "a000000/a004700/a004720/"
+NASA_TEXTURE = (
+    "https://svs.gsfc.nasa.gov/vis/a000000/"
+    "a004700/a004720/lroc_color_2k.jpg"
 )
 
-TEXTURE_URL = BASE + "lroc_color_2k.jpg"
-
-DEM_URLS = [
-    (BASE + "ldem_16_uint.tif", 16, "uint"),
-    (BASE + "ldem_4.tif", 4, "float")
-]
-
-MOON_TILES = (
-    "https://trek.nasa.gov/tiles/Moon/EQ/"
-    "LRO_WAC_Mosaic_Global_303ppd_v02/"
-    "1.0.0/default/default028mm/"
-    "{z}/{y}/{x}.jpg"
+NASA_GLOBAL_DEM = (
+    "https://svs.gsfc.nasa.gov/vis/a000000/"
+    "a004700/a004720/ldem_4.tif"
 )
 
-RADIUS_M = 1737400.0
+NASA_POLAR_DEM = (
+    "https://pgda.gsfc.nasa.gov/data/"
+    "LOLA_20mpp/LDEM_80S_80MPP_ADJ.TIF"
+)
 
-# =====================================================
-# COLORS AND DESIGN
-# =====================================================
+NASA_POLAR_SLOPE = (
+    "https://pgda.gsfc.nasa.gov/data/"
+    "LOLA_20mpp/LDSM_80S_80MPP_ADJ.TIF"
+)
+
+HORIZONS = "https://ssd.jpl.nasa.gov/api/horizons.api"
+
+MOON_RADIUS = 1737400.0
+
+MOON_GEO = CRS.from_proj4(
+    "+proj=longlat +a=1737400 +b=1737400 "
+    "+no_defs"
+)
+
+
+# ==================================================
+# STATE
+# ==================================================
+
+defaults = {
+    "language": "العربية",
+    "page": "explore",
+    "lat": -89.0,
+    "lon": 0.0,
+    "last_click": None,
+    "last_visibility": None
+}
+
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+
+# ==================================================
+# TRANSLATION
+# ==================================================
+
+TEXT = {
+    "tagline": (
+        "ما وراء الأفق، نحو القمر",
+        "Beyond the horizon, toward the Moon"
+    ),
+    "description": (
+        "استكشف القمر، واختر موقعًا، وافهم ظروف الهبوط "
+        "باستخدام بيانات علمية من NASA.",
+        "Explore the Moon, select a location and "
+        "understand mission conditions using NASA data."
+    ),
+    "explore": (
+        "استكشف واختر",
+        "Explore & Select"
+    ),
+    "surface": (
+        "كاميرا المركبة والمسح",
+        "Lander Camera & Scan"
+    ),
+    "visibility": (
+        "الشمس والأرض",
+        "Sun & Earth"
+    ),
+    "compare": (
+        "المقارنة والخطة البديلة",
+        "Compare & Plan B"
+    ),
+    "view": (
+        "طريقة العرض",
+        "View mode"
+    ),
+    "twoD": (
+        "خريطة القمر 2D",
+        "2D Moon Map"
+    ),
+    "threeD": (
+        "القمر ثلاثي الأبعاد 3D",
+        "3D Moon"
+    ),
+    "click": (
+        "اضغط على المكان الذي تريد دراسته",
+        "Click the place you want to investigate"
+    ),
+    "zoom": (
+        "مستوى التكبير",
+        "Zoom level"
+    ),
+    "selected": (
+        "الموقع الذي اخترته",
+        "Your selected location"
+    ),
+    "latitude": (
+        "خط العرض",
+        "Latitude"
+    ),
+    "longitude": (
+        "خط الطول",
+        "Longitude"
+    ),
+    "south_warning": (
+        "هذا الموقع خارج نطاق تحليل التضاريس القطبية الحالي. "
+        "اختر موقعًا جنوب خط عرض 80° جنوبًا.",
+        "This point is outside the current polar "
+        "terrain-analysis region. Choose a point "
+        "south of 80°S."
+    ),
+    "map_note": (
+        "اضغط مباشرة على الصورة لتغيير الموقع. "
+        "يمكنك التكبير دون الخروج من حدود الخريطة.",
+        "Click directly on the image to change the site. "
+        "Zooming stays inside the map boundaries."
+    ),
+    "surface_title": (
+        "انظر إلى السطح من منظور المركبة",
+        "Explore the surface from a lander's viewpoint"
+    ),
+    "surface_description": (
+        "شاهد نموذجًا افتراضيًا للتضاريس، ثم افحص "
+        "المربعات التي تغطي منطقة الدراسة.",
+        "Explore a virtual terrain view and inspect "
+        "the cells covering the selected area."
+    ),
+    "scan_button": (
+        "ابدأ مسح التضاريس",
+        "Start Terrain Scan"
+    ),
+    "scan_unavailable": (
+        "تعذر تحميل بيانات الانحدار التفصيلية من NASA. "
+        "ستبقى نتائج الخلايا غير محددة.",
+        "Detailed NASA slope data could not be loaded. "
+        "Cell assessments remain unavailable."
+    ),
+    "scan_loaded": (
+        "تم استخراج بيانات انحدار حقيقية من NASA.",
+        "Real NASA slope measurements were retrieved."
+    ),
+    "scan_limit": (
+        "هذا مسح أولي للانحدار، وليس تصريحًا بأن "
+        "المركبة تستطيع الهبوط بأمان.",
+        "This is preliminary slope screening, "
+        "not certification of landing safety."
+    ),
+    "camera_note": (
+        "هذا منظور افتراضي مبني على بيانات ارتفاعات القمر، "
+        "وليس بثًا مباشرًا من مركبة فضائية.",
+        "This is a virtual view based on lunar elevation "
+        "data, not live spacecraft footage."
+    ),
+    "mission_date": (
+        "تاريخ المهمة بتوقيت UTC",
+        "Mission date (UTC)"
+    ),
+    "duration": (
+        "مدة المهمة بالساعات",
+        "Mission duration (hours)"
+    ),
+    "calculate": (
+        "احسب ظروف المهمة",
+        "Calculate Mission Conditions"
+    ),
+    "sun": (
+        "ساعات ظهور الشمس",
+        "Sun visibility hours"
+    ),
+    "earth": (
+        "ساعات ظهور الأرض",
+        "Earth visibility hours"
+    ),
+    "both": (
+        "ساعات ظهور الشمس والأرض معًا",
+        "Simultaneous visibility hours"
+    ),
+    "horizon": (
+        "ارتفاع الشمس والأرض بالنسبة للأفق",
+        "Sun and Earth elevation above the horizon"
+    ),
+    "no_earth": (
+        "قد لا يتمكن الموقع من رؤية الأرض مباشرة "
+        "خلال الفترة المختارة.",
+        "The location may not have direct visibility "
+        "of Earth during the selected period."
+    ),
+    "visibility_note": (
+        "النتائج تقريبية لكل ساعة، ولا تحسب حجب الجبال "
+        "أو جودة الاتصال اللاسلكي.",
+        "Hourly estimates exclude terrain obstruction "
+        "and radio-link performance."
+    ),
+    "compare_title": (
+        "ماذا يحدث إذا تغيرت خطة الهبوط؟",
+        "What if the landing plan changes?"
+    ),
+    "same_site": (
+        "نفس الموقع، موعد مختلف",
+        "Same site, different date"
+    ),
+    "other_site": (
+        "موقع مختلف، نفس الموعد",
+        "Different site, same date"
+    ),
+    "delay": (
+        "التأخير بالساعات",
+        "Delay in hours"
+    ),
+    "compare_button": (
+        "قارن الخطتين",
+        "Compare Mission Plans"
+    ),
+    "original": (
+        "الخطة الأصلية",
+        "Original plan"
+    ),
+    "alternative": (
+        "الخطة البديلة",
+        "Alternative plan"
+    ),
+    "science": (
+        "المصادر والحدود العلمية",
+        "Sources & Scientific Limitations"
+    ),
+    "error": (
+        "تعذر الحصول على البيانات",
+        "Could not retrieve the data"
+    ),
+}
+
+
+def tr(key):
+    pair = TEXT.get(key, (key, key))
+    return pair[0] if st.session_state.language == "العربية" else pair[1]
+
+
+def is_ar():
+    return st.session_state.language == "العربية"
+
+
+# ==================================================
+# VISUAL DESIGN
+# ==================================================
 
 st.markdown("""
 <style>
+:root {
+  --space: #050B16;
+  --night: #0C1B2F;
+  --blue: #76C5F5;
+  --silver: #DCECF7;
+}
+
+html, body, .stApp {
+  background: #050B16 !important;
+  color: #E6F3FF;
+}
+
 .stApp {
-    color: #e7f3ff;
-    background:
-      radial-gradient(
-        ellipse at 75% 0%,
-        #152e49 0%,
-        #081526 42%,
-        #050b15 100%
-      );
+  background:
+    radial-gradient(
+      ellipse at 83% 8%,
+      rgba(49, 108, 154, .25),
+      transparent 39%
+    ),
+    radial-gradient(
+      ellipse at 8% 80%,
+      rgba(20, 58, 98, .19),
+      transparent 40%
+    ),
+    #050B16 !important;
 }
+
+[data-testid="stHeader"] {
+  background: transparent !important;
+}
+
 [data-testid="stSidebar"] {
-    background: #0a1729;
-    border-right: 1px solid #29415e;
+  display: none;
 }
+
 .block-container {
-    max-width: 1520px;
-    padding-top: 1rem;
+  max-width: 1440px;
+  padding-top: 1.2rem;
+  padding-bottom: 4rem;
 }
-h1, h2, h3 {
-    color: #ecf7ff !important;
+
+h1, h2, h3, p, label {
+  color: #EDF7FF !important;
 }
-.ofoq-hero {
-    border: 1px solid #365875;
-    border-radius: 20px;
-    background:
-      linear-gradient(110deg,
-      #081525, #112d48, #0b1c30);
-    padding: 24px 30px;
-    margin-bottom: 22px;
+
+h1 {
+  letter-spacing: .02em;
 }
-.ofoq-logo {
-    font-size: 39px;
-    font-weight: 800;
-    color: #dceef9;
-    letter-spacing: 3px;
-}
-.ofoq-sub {
-    color: #8ec9f1;
-    font-size: 12px;
-    letter-spacing: 2px;
-    font-weight: 700;
-}
-.ofoq-hero p {
-    color: #bbcee0;
-    margin-top: 12px;
-}
+
 [data-testid="stMetric"] {
-    background: #12263e;
-    border: 1px solid #31516b;
-    border-radius: 13px;
-    padding: 15px;
+  background: linear-gradient(
+    145deg, #122A44, #0B1B30
+  );
+  padding: 19px 20px;
+  border: 1px solid #385775;
+  border-radius: 16px;
 }
+
+[data-testid="stMetricValue"] {
+  color: #DFF5FF;
+}
+
+[data-testid="stMetricLabel"] {
+  color: #A9D7F1;
+}
+
+.stButton button[kind="primary"],
+.stDownloadButton button {
+  background: #76C5F5 !important;
+  color: #071323 !important;
+  border-radius: 12px !important;
+  border: 0 !important;
+  font-weight: 750 !important;
+}
+
 .stButton button {
-    border-radius: 10px;
+  border-radius: 12px !important;
+  border: 1px solid #365875;
 }
-.stButton button[kind="primary"] {
-    background: #71c5f5;
-    color: #06111e;
-    font-weight: 800;
-    border: 0;
+
+[data-testid="stSegmentedControl"] {
+  border-radius: 13px;
+}
+
+[data-testid="stAlert"] {
+  border-radius: 12px;
+}
+
+.ofoq-hero {
+  position: relative;
+  overflow: hidden;
+  min-height: 225px;
+  padding: 31px 38px;
+  border-radius: 24px;
+  border: 1px solid rgba(139, 204, 244, .34);
+  background:
+    radial-gradient(
+      circle at 82% 48%,
+      rgba(121, 200, 253, .22),
+      transparent 19%
+    ),
+    radial-gradient(
+      1px 1px at 15% 22%, white, transparent
+    ),
+    radial-gradient(
+      2px 2px at 75% 18%, #A5D8FF, transparent
+    ),
+    radial-gradient(
+      1px 1px at 54% 72%, white, transparent
+    ),
+    linear-gradient(110deg, #091523, #163450);
+  box-shadow: 0 24px 70px #00000054;
+  margin-bottom: 20px;
+}
+
+.ofoq-hero:after {
+  content: "";
+  position: absolute;
+  width: 300px;
+  height: 300px;
+  border: 2px solid rgba(110, 200, 255, .45);
+  border-radius: 50%;
+  top: -150px;
+  right: 65px;
+  box-shadow: 0 0 44px rgba(110, 200, 255, .15);
+}
+
+.ofoq-small {
+  color: #8ED5FC;
+  letter-spacing: .20em;
+  font-size: 11px;
+  font-weight: 750;
+}
+
+.ofoq-logo {
+  font-size: clamp(38px, 5vw, 68px);
+  color: #E5F2FD;
+  font-weight: 850;
+  letter-spacing: .07em;
+  text-shadow: 0 0 28px #76C5F53F;
+  margin: 6px 0;
+}
+
+.ofoq-desc {
+  color: #CAE0F0;
+  font-size: 16px;
+  max-width: 760px;
+  line-height: 1.8;
+}
+
+.ofoq-card {
+  background: #0B2034;
+  border: 1px solid #31516B;
+  border-radius: 18px;
+  padding: 17px 20px;
+  margin: 9px 0 16px;
+}
+
+.ofoq-chip {
+  display: inline-block;
+  color: #95DBFF;
+  border: 1px solid #477A9C;
+  border-radius: 100px;
+  padding: 7px 12px;
+  font-size: 12px;
+}
+
+hr {
+  border-color: #27445E !important;
 }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("""
-<div class="ofoq-hero">
-    <div class="ofoq-sub">
-        BEYOND THE HORIZON, TOWARD THE MOON
+
+# ==================================================
+# LANGUAGE AND NAVIGATION
+# ==================================================
+
+top_left, top_right = st.columns([5, 1])
+
+with top_right:
+    st.segmented_control(
+        "Language",
+        ["العربية", "English"],
+        key="language",
+        default="العربية",
+        label_visibility="collapsed"
+    )
+
+direction = "rtl" if is_ar() else "ltr"
+
+st.markdown(
+    f"""
+    <div class="ofoq-hero" dir="{direction}">
+       <div class="ofoq-small">
+         NASA SPACE APPS CHALLENGE 2026
+       </div>
+       <div class="ofoq-logo">أُفُق | OFOQ</div>
+       <div class="ofoq-small">{tr("tagline")}</div>
+       <p class="ofoq-desc">
+           {tr("description")}
+       </p>
+       <span class="ofoq-chip">
+           LUNAR MISSION INTELLIGENCE
+       </span>
     </div>
-    <div class="ofoq-logo">أُفُق | OFOQ</div>
-    <p>
-       Explore real lunar terrain.
-       Choose a location with one click.
-       Analyze mission conditions using NASA data.
-    </p>
-</div>
-""", unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True
+)
 
-# =====================================================
-# SHARED STATE
-# =====================================================
+PAGES = ["explore", "surface", "visibility", "compare"]
 
-if "lat" not in st.session_state:
-    st.session_state.lat = -89.0
+page = st.segmented_control(
+    "Navigation",
+    PAGES,
+    format_func=tr,
+    key="page",
+    default="explore",
+    label_visibility="collapsed"
+)
 
-if "lon" not in st.session_state:
-    st.session_state.lon = 0.0
-
-if "map_message" not in st.session_state:
-    st.session_state.map_message = ""
-
-if "visibility_result" not in st.session_state:
-    st.session_state.visibility_result = None
+if page is None:
+    page = "explore"
 
 
-def normalize_lon(lon):
-    return ((float(lon) + 180) % 360) - 180
-
-
-def select_location(lat, lon):
-    st.session_state.lat = round(float(lat), 5)
-    st.session_state.lon = round(
-        normalize_lon(lon), 5
-    )
-
-
-# =====================================================
-# NASA IMAGE AND TERRAIN DATA
-# =====================================================
+# ==================================================
+# REAL NASA MOON IMAGE
+# ==================================================
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def load_moon_texture():
-    response = requests.get(
-        TEXTURE_URL, timeout=35
-    )
-    response.raise_for_status()
-    return (
-        "data:image/jpeg;base64,"
-        + base64.b64encode(
-            response.content
-        ).decode("ascii")
-    )
+def get_texture_bytes():
+    r = requests.get(NASA_TEXTURE, timeout=35)
+    r.raise_for_status()
+    return r.content
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def load_global_dem():
-    """
-    Automatically downloads real NASA LOLA terrain.
-    First try 16 pixels/degree, then 4.
-    This is regional topography, NOT landing hazard data.
-    """
-    errors = []
-
-    for url, resolution, kind in DEM_URLS:
-        try:
-            response = requests.get(
-                url, timeout=90
-            )
-            response.raise_for_status()
-
-            array = tifffile.imread(
-                BytesIO(response.content)
-            )
-
-            return array, resolution, kind
-
-        except Exception as error:
-            errors.append(str(error))
-
-    raise RuntimeError(
-        "NASA DEM could not be loaded: "
-        + "; ".join(errors)
-    )
+def get_texture_image():
+    return Image.open(
+        BytesIO(get_texture_bytes())
+    ).convert("RGB")
 
 
-def sample_lunar_terrain(
-    lat, lon, radius_km=12, count=73
-):
-    """
-    Sample a regional 24 km x 24 km area.
-
-    Lunar global DEM is an equirectangular image:
-    x = longitude, y = latitude.
-    Pixel interpolation does not improve source resolution.
-    """
-
-    source, ppd, kind = load_global_dem()
-
-    height, width = source.shape[:2]
-
-    distance = radius_km * 1000.0
-
-    axis = np.linspace(
-        -distance, distance, count
-    )
-
-    xx, yy = np.meshgrid(axis, axis)
-
-    lat_grid = (
-        lat
-        + np.degrees(yy / RADIUS_M)
-    )
-
-    cosine = max(
-        abs(np.cos(np.radians(lat))),
-        0.01
-    )
-
-    lon_grid = (
-        lon
-        + np.degrees(
-            xx / (RADIUS_M * cosine)
-        )
-    )
-
-    lat_grid = np.clip(
-        lat_grid, -90, 90
-    )
-
-    lon_grid = (
-        (lon_grid + 180) % 360
-    ) - 180
-
-    px = (
-        (lon_grid + 180) * ppd - 0.5
-    ) % width
-
-    py = (
-        (90 - lat_grid) * ppd - 0.5
-    )
-
-    py = np.clip(py, 0, height - 1.001)
-
-    x0 = np.floor(px).astype(int)
-    y0 = np.floor(py).astype(int)
-
-    x1 = (x0 + 1) % width
-    y1 = np.minimum(y0 + 1, height - 1)
-
-    fx = px - x0
-    fy = py - y0
-
-    a = source[y0, x0].astype(float)
-    b = source[y0, x1].astype(float)
-    c = source[y1, x0].astype(float)
-    d = source[y1, x1].astype(float)
-
-    values = (
-        a * (1 - fx) * (1 - fy)
-        + b * fx * (1 - fy)
-        + c * (1 - fx) * fy
-        + d * fx * fy
-    )
-
-    if kind == "uint":
-        # NASA unsigned DEM uses half-meter units
-        # offset by +20,000.
-        elevations = (
-            values - 20000
-        ) / 2.0
-    else:
-        # Floating TIFF uses kilometers.
-        elevations = values * 1000.0
-
-    return axis, elevations, ppd
-
-
-# =====================================================
-# CLICKABLE 2D LUNAR MAP
-# =====================================================
-
-def map_click_callback():
-    state = st.session_state.get(
-        "ofoq_clickable_map", {}
-    ) or {}
-
-    point = state.get("last_clicked")
-
-    if point is None:
-        return
-
-    lat = float(point["lat"])
-    lon = float(point["lng"])
-
-    if -90 <= lat <= -75:
-        select_location(lat, lon)
-        st.session_state.map_message = (
-            "Location selected successfully."
-        )
-    else:
-        st.session_state.map_message = (
-            "Choose a point between 75°S "
-            "and 90°S."
-        )
-
-
-def make_locked_map():
-    moon = folium.Map(
-        location=[-83.0, 0.0],
-        zoom_start=5,
-        min_zoom=5,
-        max_zoom=8,
-        tiles=None,
-        crs="EPSG4326",
-        zoom_control=True,
-        control_scale=False
-    )
-
-    # Restrict movement to the lunar south-pole area.
-    moon.options["maxBounds"] = [
-        [-90, -180],
-        [-75, 180]
-    ]
-    moon.options["maxBoundsViscosity"] = 1.0
-    moon.options["worldCopyJump"] = False
-
-    # Dark fallback outside any missing image tiles.
-    moon.get_root().header.add_child(
-        folium.Element("""
-        <style>
-        .leaflet-container {
-            background: #071526 !important;
-        }
-        </style>
-        """)
-    )
-
-    folium.TileLayer(
-        tiles=MOON_TILES,
-        attr="NASA/JPL Moon Trek — LRO WAC",
-        name="Lunar surface imagery",
-        overlay=False,
-        control=False,
-        no_wrap=True,
-        max_zoom=8
-    ).add_to(moon)
-
-    return moon
-
-
-def show_clickable_map():
-    m = make_locked_map()
-
-    markers = folium.FeatureGroup(
-        name="Selected location"
-    )
-
-    folium.CircleMarker(
-        location=[
-            st.session_state.lat,
-            st.session_state.lon
-        ],
-        radius=8,
-        color="#83dfff",
-        weight=3,
-        fill=True,
-        fill_color="#40b7f5",
-        fill_opacity=0.95,
-        tooltip="Your selected site"
-    ).add_to(markers)
-
-    st_folium(
-        m,
-        key="ofoq_clickable_map",
-        height=540,
-        use_container_width=True,
-        returned_objects=["last_clicked"],
-        on_change=map_click_callback,
-        feature_group_to_add=markers,
-        wrap_longitude=False
-    )
-
+def selected_position_card():
     a, b = st.columns(2)
 
     a.metric(
-        "Selected latitude",
+        tr("latitude"),
         f"{st.session_state.lat:.5f}°"
     )
 
     b.metric(
-        "Selected longitude",
+        tr("longitude"),
         f"{st.session_state.lon:.5f}°"
     )
 
-    if st.session_state.map_message:
-        st.caption(
-            st.session_state.map_message
-        )
 
-    st.info(
-        "Click any point on the lunar map. "
-        "The marker and coordinates update automatically."
+def moon_2d():
+    st.subheader(tr("click"))
+
+    zoom = st.slider(
+        tr("zoom"),
+        min_value=1,
+        max_value=6,
+        value=1
     )
 
+    source = get_texture_image()
+    W, H = source.size
 
-# =====================================================
-# ROTATING 3D MOON
-# =====================================================
+    crop_w = W / zoom
+    crop_h = H / zoom
 
-def show_3d_moon():
-    texture = load_moon_texture()
+    center_x = (
+        st.session_state.lon + 180
+    ) / 360 * W
 
-    page = """
+    center_y = (
+        90 - st.session_state.lat
+    ) / 180 * H
+
+    if zoom == 1:
+        left, top = 0, 0
+        right, bottom = W, H
+    else:
+        left = max(
+            0, min(W - crop_w, center_x - crop_w / 2)
+        )
+        top = max(
+            0, min(H - crop_h, center_y - crop_h / 2)
+        )
+        right = left + crop_w
+        bottom = top + crop_h
+
+    image = source.crop(
+        (
+            int(left),
+            int(top),
+            int(right),
+            int(bottom)
+        )
+    ).resize(
+        (1024, 512),
+        Image.Resampling.LANCZOS
+    )
+
+    draw = ImageDraw.Draw(image)
+
+    px = (
+        center_x - left
+    ) / (right - left) * 1024
+
+    py = (
+        center_y - top
+    ) / (bottom - top) * 512
+
+    if 0 <= px < 1024 and 0 <= py < 512:
+        draw.ellipse(
+            (px - 9, py - 9, px + 9, py + 9),
+            outline="#76C5F5",
+            width=4
+        )
+        draw.ellipse(
+            (px - 3, py - 3, px + 3, py + 3),
+            fill="#FFFFFF"
+        )
+
+    click = streamlit_image_coordinates(
+        image,
+        width=1024,
+        key=f"ofoq_click_{zoom}"
+    )
+
+    if click is not None:
+        signature = (
+            click.get("unix_time"),
+            click.get("x"),
+            click.get("y"),
+            zoom
+        )
+
+        if signature != st.session_state.last_click:
+            st.session_state.last_click = signature
+
+            x = max(0, min(1023, click["x"]))
+            y = max(0, min(511, click["y"]))
+
+            true_x = left + x / 1024 * (right - left)
+            true_y = top + y / 512 * (bottom - top)
+
+            lon = true_x / W * 360 - 180
+            lat = 90 - true_y / H * 180
+
+            st.session_state.lat = round(
+                float(lat), 5
+            )
+            st.session_state.lon = round(
+                float(lon), 5
+            )
+
+            st.rerun()
+
+    st.caption(tr("map_note"))
+    selected_position_card()
+
+
+# ==================================================
+# 3D MOON GLOBE
+# ==================================================
+
+def moon_3d():
+    texture = (
+        "data:image/jpeg;base64,"
+        + base64.b64encode(
+            get_texture_bytes()
+        ).decode("ascii")
+    )
+
+    page_html = """
     <html>
     <head>
     <style>
       body {
-        background:#060d18;
         margin:0;
         overflow:hidden;
-        font-family:Arial;
+        background:#060D19;
       }
-      #scene {
-        width:100%;
-        height:520px;
-      }
-      .label {
+      #scene {width:100%;height:530px;}
+      .hud {
         position:absolute;
-        left:15px;
         bottom:15px;
-        padding:10px 15px;
-        color:#c4e9ff;
-        background:#0d243bcc;
-        border:1px solid #315b83;
+        left:15px;
+        color:#D9F3FF;
+        background:#10273CCC;
+        border:1px solid #477A9C;
         border-radius:10px;
-        font-size:13px;
+        padding:12px;
+        font:13px Arial;
       }
     </style>
     <script type="importmap">
     {
       "imports":{
         "three":
-        "https://unpkg.com/three@0.160.0/build/three.module.js",
+          "https://unpkg.com/three@0.160.0/build/three.module.js",
         "three/addons/":
-        "https://unpkg.com/three@0.160.0/examples/jsm/"
+          "https://unpkg.com/three@0.160.0/examples/jsm/"
       }
     }
     </script>
     </head>
     <body>
-      <div id="scene"></div>
-      <div class="label">
-        Drag to rotate • Scroll to zoom
-      </div>
-      <script type="module">
-        import * as THREE from "three";
-        import { OrbitControls } from
-          "three/addons/controls/OrbitControls.js";
+    <div id="scene"></div>
+    <div class="hud">
+       DRAG TO ROTATE · SCROLL TO ZOOM
+    </div>
+    <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from
+      "three/addons/controls/OrbitControls.js";
 
-        const root = document.getElementById("scene");
-        const scene = new THREE.Scene();
+    const el = document.getElementById("scene");
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x060d19);
 
-        const camera = new THREE.PerspectiveCamera(
-          43, 1, 0.1, 100
-        );
+    const camera = new THREE.PerspectiveCamera(
+      43,1,.1,100
+    );
+    camera.position.set(0,0,5);
 
-        camera.position.set(0,0,5);
+    const renderer = new THREE.WebGLRenderer({
+      antialias:true
+    });
+    renderer.setPixelRatio(
+      Math.min(window.devicePixelRatio,2)
+    );
+    el.appendChild(renderer.domElement);
 
-        const renderer = new THREE.WebGLRenderer({
-          antialias:true
-        });
+    const texture = new THREE.TextureLoader().load(
+      __TEXTURE__
+    );
 
-        renderer.setPixelRatio(
-          Math.min(window.devicePixelRatio,2)
-        );
-        root.appendChild(renderer.domElement);
+    texture.colorSpace = THREE.SRGBColorSpace;
 
-        const tex = new THREE.TextureLoader().load(
-          __TEXTURE__
-        );
-        tex.colorSpace = THREE.SRGBColorSpace;
+    const globe = new THREE.Mesh(
+      new THREE.SphereGeometry(1.7,96,64),
+      new THREE.MeshStandardMaterial({
+        map:texture,roughness:1
+      })
+    );
 
-        const moon = new THREE.Mesh(
-          new THREE.SphereGeometry(1.7,96,72),
-          new THREE.MeshStandardMaterial({
-            map:tex,
-            roughness:1
-          })
-        );
+    scene.add(globe);
+    scene.add(new THREE.AmbientLight(0xffffff,1.3));
 
-        scene.add(moon);
-        scene.add(
-          new THREE.AmbientLight(0xffffff,1.4)
-        );
+    const light = new THREE.DirectionalLight(
+      0xffffff,2
+    );
+    light.position.set(5,3,6);
+    scene.add(light);
 
-        const light = new THREE.DirectionalLight(
-          0xffffff,2
-        );
-        light.position.set(4,3,6);
-        scene.add(light);
+    const controls = new OrbitControls(
+      camera,renderer.domElement
+    );
+    controls.enableDamping=true;
+    controls.enablePan=false;
+    controls.minDistance=2.2;
+    controls.maxDistance=8;
 
-        const controls = new OrbitControls(
-          camera,renderer.domElement
-        );
+    function resize(){
+      const w=el.clientWidth || 800;
+      renderer.setSize(w,530);
+      camera.aspect=w/530;
+      camera.updateProjectionMatrix();
+    }
 
-        controls.enableDamping = true;
-        controls.enablePan = false;
-        controls.minDistance = 2.2;
-        controls.maxDistance = 8;
+    window.addEventListener("resize",resize);
+    resize();
 
-        function resize(){
-          const w = root.clientWidth || 800;
-          renderer.setSize(w,520);
-          camera.aspect = w/520;
-          camera.updateProjectionMatrix();
-        }
-
-        window.addEventListener("resize",resize);
-        resize();
-
-        function animate(){
-          requestAnimationFrame(animate);
-          controls.update();
-          renderer.render(scene,camera);
-        }
-        animate();
-      </script>
+    function animate(){
+      requestAnimationFrame(animate);
+      controls.update();
+      renderer.render(scene,camera);
+    }
+    animate();
+    </script>
     </body>
     </html>
     """
 
-    page = page.replace(
-        "__TEXTURE__",
-        json.dumps(texture)
-    )
-
     components.html(
-        page,
-        height=525,
+        page_html.replace(
+            "__TEXTURE__",
+            json.dumps(texture)
+        ),
+        height=535,
         scrolling=False
     )
 
 
-# =====================================================
-# ACTUAL REGIONAL TERRAIN SCANNER
-# =====================================================
+# ==================================================
+# REAL NASA TERRAIN
+# ==================================================
 
-def create_scan_cells(z):
-    n = z.shape[0]
-    cells = []
+def read_remote_cog(url, lat, lon, size=96):
+    """
+    Read only a small window from NASA polar COG.
+    Never download the entire large GeoTIFF.
+    """
 
-    low = float(np.nanquantile(z, 0.33))
-    high = float(np.nanquantile(z, 0.67))
+    with rasterio.Env(
+        GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
+        GDAL_HTTP_TIMEOUT="15",
+        GDAL_HTTP_MAX_RETRY="1"
+    ):
+        with rasterio.open(
+            "/vsicurl/" + url
+        ) as src:
 
-    for row in range(8):
-        for col in range(8):
+            if src.crs is None:
+                raise ValueError(
+                    "NASA raster has no CRS"
+                )
 
-            r0 = round(row * n / 8)
-            r1 = round((row + 1) * n / 8)
-
-            c0 = round(col * n / 8)
-            c1 = round((col + 1) * n / 8)
-
-            block = z[r0:r1, c0:c1]
-
-            median = float(
-                np.nanmedian(block)
+            transformer = Transformer.from_crs(
+                MOON_GEO,
+                src.crs,
+                always_xy=True
             )
 
-            if median < low:
-                category = "lower"
-            elif median > high:
-                category = "higher"
-            else:
-                category = "middle"
+            x, y = transformer.transform(lon, lat)
 
-            cells.append({
-                "id": f"{row+1}-{col+1}",
-                "height": round(median, 1),
-                "category": category
-            })
+            row, col = src.index(x, y)
+
+            half = size // 2
+
+            if (
+                row - half < 0
+                or col - half < 0
+                or row + half >= src.height
+                or col + half >= src.width
+            ):
+                raise ValueError(
+                    "Point outside raster coverage"
+                )
+
+            window = Window(
+                col - half,
+                row - half,
+                size,
+                size
+            )
+
+            a = src.read(
+                1,
+                window=window,
+                out_shape=(65, 65),
+                resampling=Resampling.bilinear,
+                masked=True
+            )
+
+            data = np.ma.array(
+                a.astype(float)
+            ).filled(np.nan)
+
+            if np.isinf(data).any():
+                data[~np.isfinite(data)] = np.nan
+
+            pixel_m = max(
+                abs(src.transform.a),
+                abs(src.transform.e)
+            )
+
+            return data, pixel_m
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_polar_scan(lat, lon):
+    dem, resolution = read_remote_cog(
+        NASA_POLAR_DEM, lat, lon
+    )
+
+    slope, _ = read_remote_cog(
+        NASA_POLAR_SLOPE, lat, lon
+    )
+
+    return dem, slope, resolution
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_global_dem():
+    r = requests.get(
+        NASA_GLOBAL_DEM,
+        timeout=45
+    )
+    r.raise_for_status()
+
+    return tifffile.imread(
+        BytesIO(r.content)
+    ).astype(float) * 1000.0
+
+
+def coarse_virtual_terrain(lat, lon):
+    """
+    Global NASA DEM for regional illustration only.
+    It is too coarse for landing safety screening.
+    """
+
+    source = get_global_dem()
+    H, W = source.shape
+
+    stere = CRS.from_proj4(
+        "+proj=stere +lat_0=-90 +lat_ts=-90 "
+        "+lon_0=0 +a=1737400 +b=1737400 "
+        "+units=m +no_defs"
+    )
+
+    fwd = Transformer.from_crs(
+        MOON_GEO, stere, always_xy=True
+    )
+
+    inv = Transformer.from_crs(
+        stere, MOON_GEO, always_xy=True
+    )
+
+    cx, cy = fwd.transform(lon, lat)
+
+    axis = np.linspace(-25000, 25000, 65)
+
+    xx, yy = np.meshgrid(
+        cx + axis,
+        cy + axis
+    )
+
+    glon, glat = inv.transform(xx, yy)
+
+    col = np.clip(
+        np.round(
+            (glon + 180) / 360 * (W - 1)
+        ).astype(int),
+        0, W - 1
+    )
+
+    row = np.clip(
+        np.round(
+            (90 - glat) / 180 * (H - 1)
+        ).astype(int),
+        0, H - 1
+    )
+
+    return source[row, col]
+
+
+def make_cells(slope):
+    cells = []
+
+    for r in range(8):
+        for c in range(8):
+            block = slope[
+                r * 8:(r + 1) * 8,
+                c * 8:(c + 1) * 8
+            ]
+
+            valid = block[np.isfinite(block)]
+            coverage = len(valid) / block.size
+
+            cell = {
+                "id": f"{r + 1}-{c + 1}",
+                "value": None,
+                "status": "unknown",
+                "coverage": round(
+                    coverage * 100, 1
+                )
+            }
+
+            if coverage >= 0.75:
+                # 90th percentile highlights
+                # steeper portions of the cell.
+                p90 = float(
+                    np.percentile(valid, 90)
+                )
+
+                cell["value"] = round(p90, 2)
+
+                if p90 <= 5:
+                    cell["status"] = "gentle"
+                elif p90 <= 12:
+                    cell["status"] = "review"
+                else:
+                    cell["status"] = "steep"
+
+            cells.append(cell)
 
     return cells
 
 
-def show_scanner(cells):
-    code = """
+def render_lander_scene(dem, cells, source_label):
+    values = np.asarray(dem, dtype=float)
+
+    if not np.isfinite(values).any():
+        raise ValueError("No valid DEM elevations")
+
+    median = np.nanmedian(values)
+
+    values = np.nan_to_num(
+        values,
+        nan=median
+    )
+
+    # Visual vertical exaggeration.
+    relative = np.clip(
+        (values - median) / 300.0,
+        -2.2,
+        2.2
+    )
+
+    data = relative.tolist()
+
+    scene_html = """
     <html>
     <head>
     <style>
-    body {
-      background:#071323;
-      color:#e6f6ff;
-      margin:0;
-      padding:14px;
-      font-family:Arial;
-    }
-    .head {
-      display:flex;
-      justify-content:space-between;
-      color:#8dd9fb;
-      padding:12px;
-      border:1px solid #294b67;
-      border-radius:10px;
-      font-size:12px;
-    }
-    .frame {
-      margin-top:13px;
-      padding:20px;
-      position:relative;
-      overflow:hidden;
-      background:#0d2035;
-      border:1px solid #345572;
-      border-radius:14px;
-    }
-    .grid {
-      display:grid;
-      grid-template-columns:repeat(8,1fr);
-      gap:5px;
-      max-width:560px;
-      margin:auto;
-    }
-    .cell {
-      aspect-ratio:1;
-      border:1px solid #8abfe0;
-      border-radius:3px;
-      opacity:.92;
-      cursor:pointer;
-    }
-    .cell:hover {
-      outline:2px solid white;
-      transform:scale(1.05);
-    }
-    .lower { background:#203c68; }
-    .middle { background:#347da7; }
-    .higher { background:#8dccf0; }
-    .beam {
-      position:absolute;
-      left:0;
-      width:100%;
-      height:4px;
-      background:#d9f5ff;
-      box-shadow:0 0 24px #58d8ff;
-      pointer-events:none;
-      animation:sweep 4s linear infinite;
-    }
-    @keyframes sweep {
-      from { top:0%; }
-      to { top:100%; }
-    }
-    #details {
-      padding:16px;
-      margin-top:12px;
-      background:#102a43;
-      border:1px solid #345572;
-      border-radius:12px;
-      min-height:65px;
-    }
-    </style>
-    </head>
-    <body>
-      <div class="head">
-        <span>OFOQ / REGIONAL TERRAIN SCAN</span>
-        <span>NASA LOLA DATA</span>
-      </div>
-      <div class="frame">
-        <div class="beam"></div>
-        <div class="grid" id="grid"></div>
-      </div>
-      <div id="details">
-        Click a cell to inspect its elevation.
-      </div>
-      <script>
-        const cells = __CELLS__;
-        const grid = document.getElementById("grid");
-        const details = document.getElementById("details");
-
-        cells.forEach(cell => {
-          const b = document.createElement("button");
-          b.className = "cell " + cell.category;
-          b.title = "Cell " + cell.id;
-
-          b.onclick = () => {
-            details.textContent =
-              "Cell " + cell.id +
-              " | Regional elevation: " +
-              cell.height + " meters" +
-              " | Relative category: " +
-              cell.category;
-          };
-
-          grid.appendChild(b);
-        });
-      </script>
-    </body>
-    </html>
-    """
-
-    code = code.replace(
-        "__CELLS__",
-        json.dumps(cells)
-    )
-
-    components.html(
-        code,
-        height=700,
-        scrolling=False
-    )
-
-
-# =====================================================
-# DIFFERENT VIEW: VIRTUAL LANDER CAMERA
-# =====================================================
-
-def show_lander_camera(z):
-    """
-    Build a low-angle 3D terrain experience
-    from actual NASA global DEM elevations.
-    The terrain is vertically exaggerated.
-    """
-
-    relative = z - np.nanmedian(z)
-
-    # Visual vertical scale only.
-    heights = np.clip(
-        relative / 600.0,
-        -1.7,
-        1.7
-    )
-
-    heights = np.nan_to_num(heights)
-
-    data = heights.tolist()
-
-    code = """
-    <html>
-    <head>
-    <style>
-      body {
+      * {box-sizing:border-box;}
+      body{
         margin:0;
+        background:#040B15;
+        font-family:Arial,sans-serif;
         overflow:hidden;
-        background:#050d19;
-        font-family:Arial;
+        color:#DDF5FF;
       }
-      #scene {
-        width:100%;
-        height:540px;
-      }
-      .camera-hud {
+      #stage{height:560px;width:100%;}
+      .hud{
         position:absolute;
-        top:15px;
-        left:16px;
-        color:#aee5ff;
-        padding:10px 15px;
-        background:#0c243bd9;
-        border:1px solid #366b8e;
-        border-radius:9px;
+        top:16px;left:16px;
+        border:1px solid #76C5F577;
+        background:#0B1D32D9;
+        padding:13px 17px;
+        border-radius:12px;
         font-size:12px;
+        letter-spacing:1px;
+        z-index:9;
       }
-      .reticle {
+      .beam{
         position:absolute;
-        top:50%;
-        left:50%;
-        width:32px;
-        height:32px;
-        margin:-16px;
-        border:1px solid #a7e7ff;
+        pointer-events:none;
+        left:0;right:0;
+        top:0;height:2px;
+        background:#9DE5FF;
+        box-shadow:0 0 25px #76C5F5;
+        animation:scan 5s linear infinite;
+        z-index:5;
+        opacity:.55;
+      }
+      @keyframes scan{
+        from{top:0%}
+        to{top:100%}
+      }
+      .cross{
+        position:absolute;
+        left:50%;top:50%;
+        width:26px;height:26px;
+        transform:translate(-50%,-50%);
+        border:1px solid #9EDFFF;
         border-radius:50%;
         pointer-events:none;
       }
-      .reticle:after {
-        content:"+";
-        display:block;
-        color:#a7e7ff;
-        text-align:center;
-        font-size:23px;
-        line-height:30px;
-      }
-      .bottom {
+      .bottom{
         position:absolute;
-        bottom:13px;
-        left:15px;
-        background:#10263ddd;
-        color:#dcefff;
-        border-radius:8px;
-        padding:10px;
-        font-size:12px;
+        left:16px;bottom:15px;
+        max-width:370px;
+        background:#081B30E8;
+        border:1px solid #3B698B;
+        border-radius:12px;
+        padding:14px 17px;
+        font-size:13px;
+        line-height:1.6;
+      }
+      #detail{
+        color:#E6F7FF;
+      }
+      #detail small{
+        color:#9ECBE7;
       }
     </style>
     <script type="importmap">
     {
       "imports":{
         "three":
-        "https://unpkg.com/three@0.160.0/build/three.module.js",
+          "https://unpkg.com/three@0.160.0/build/three.module.js",
         "three/addons/":
-        "https://unpkg.com/three@0.160.0/examples/jsm/"
+          "https://unpkg.com/three@0.160.0/examples/jsm/"
       }
     }
     </script>
     </head>
     <body>
-      <div id="scene"></div>
-      <div class="camera-hud">
-        OFOQ / VIRTUAL LANDER VIEW<br>
-        TERRAIN RECONNAISSANCE
+      <div id="stage"></div>
+      <div class="beam"></div>
+      <div class="cross"></div>
+      <div class="hud">
+        OFOQ / LUNAR TERRAIN RECON<br>
+        VIRTUAL LANDER PERSPECTIVE
       </div>
-      <div class="reticle"></div>
-      <div class="bottom">
-        Drag to look around · Scroll to zoom<br>
-        Simulated view based on NASA elevations
+      <div class="bottom" id="detail">
+        Click a terrain cell to inspect it.<br>
+        <small>__SOURCE__</small>
       </div>
+
       <script type="module">
       import * as THREE from "three";
-      import { OrbitControls } from
+      import {OrbitControls} from
         "three/addons/controls/OrbitControls.js";
 
-      const values = __HEIGHTS__;
-      const n = values.length;
+      const heights=__HEIGHTS__;
+      const cells=__CELLS__;
+      const n=heights.length;
 
-      const root = document.getElementById("scene");
-      const scene = new THREE.Scene();
-      scene.background = new THREE.Color(0x050d19);
+      const host=document.getElementById("stage");
+      const detail=document.getElementById("detail");
 
-      const camera = new THREE.PerspectiveCamera(
-        68, 1, 0.1, 100
+      const scene=new THREE.Scene();
+      scene.background=new THREE.Color(0x081322);
+
+      const camera=new THREE.PerspectiveCamera(
+        65,1,.1,100
       );
+      camera.position.set(0,3.5,12);
 
-      camera.position.set(0,2.8,7.5);
-
-      const renderer = new THREE.WebGLRenderer({
+      const renderer=new THREE.WebGLRenderer({
         antialias:true
       });
-
       renderer.setPixelRatio(
         Math.min(window.devicePixelRatio,2)
       );
+      host.appendChild(renderer.domElement);
 
-      root.appendChild(renderer.domElement);
-
-      const geometry = new THREE.PlaneGeometry(
-        12,12,n-1,n-1
+      const terrainGeometry=new THREE.PlaneGeometry(
+        16,16,n-1,n-1
       );
 
-      const pos = geometry.attributes.position;
+      const positions=terrainGeometry.attributes.position;
 
-      for (let row=0;row<n;row++){
-        for (let col=0;col<n;col++){
-          let index = row*n+col;
-          pos.setZ(index,values[row][col]);
+      for(let y=0;y<n;y++){
+        for(let x=0;x<n;x++){
+          const index=y*n+x;
+          positions.setZ(index,heights[y][x]);
         }
       }
 
-      geometry.computeVertexNormals();
+      terrainGeometry.computeVertexNormals();
 
-      const material = new THREE.MeshStandardMaterial({
-        color:0xadb6c4,
-        roughness:1,
-        side:THREE.DoubleSide
-      });
-
-      const terrain = new THREE.Mesh(
-        geometry,material
-      );
-
-      terrain.rotation.x=-Math.PI/2;
-      scene.add(terrain);
-
-      scene.add(
-        new THREE.AmbientLight(0xffffff,1.3)
-      );
-
-      const sun = new THREE.DirectionalLight(
-        0xe3f2ff,2.3
-      );
-
-      sun.position.set(-4,8,5);
-      scene.add(sun);
-
-      const grid = new THREE.GridHelper(
-        12,8,0x76d7ff,0x31546c
-      );
-
-      grid.position.y=2.0;
-      scene.add(grid);
-
-      const beam = new THREE.Mesh(
-        new THREE.PlaneGeometry(12,0.06),
-        new THREE.MeshBasicMaterial({
-          color:0xa7eaff,
-          side:THREE.DoubleSide
+      const surface=new THREE.Mesh(
+        terrainGeometry,
+        new THREE.MeshStandardMaterial({
+          color:0x929BA8,
+          roughness:1,
+          side:THREE.DoubleSide,
+          flatShading:false
         })
       );
 
-      beam.rotation.x=-Math.PI/2;
-      beam.position.y=2.07;
-      scene.add(beam);
+      const group=new THREE.Group();
+      group.add(surface);
 
-      const controls = new OrbitControls(
+      // 8 x 8 clickable scan cells
+      const squares=[];
+      const size=2;
+
+      cells.forEach((cell,index)=>{
+        const row=Math.floor(index/8);
+        const col=index%8;
+
+        const x0=-8+col*size;
+        const y0=8-row*size;
+
+        const sample=(r,c)=>{
+          r=Math.min(64,Math.max(0,r));
+          c=Math.min(64,Math.max(0,c));
+          return heights[r][c]+0.045;
+        };
+
+        const r0=row*8;
+        const c0=col*8;
+
+        const vertices=new Float32Array([
+          x0,      y0,      sample(r0,c0),
+          x0+size, y0,      sample(r0,c0+8),
+          x0,      y0-size, sample(r0+8,c0),
+
+          x0+size, y0,      sample(r0,c0+8),
+          x0+size, y0-size, sample(r0+8,c0+8),
+          x0,      y0-size, sample(r0+8,c0)
+        ]);
+
+        const geometry=new THREE.BufferGeometry();
+
+        geometry.setAttribute(
+          "position",
+          new THREE.BufferAttribute(vertices,3)
+        );
+        geometry.computeVertexNormals();
+
+        let color=0x93A2B3;
+
+        if(cell.status==="gentle")
+          color=0x5CBEED;
+        if(cell.status==="review")
+          color=0xD8B770;
+        if(cell.status==="steep")
+          color=0x64758C;
+
+        const tile=new THREE.Mesh(
+          geometry,
+          new THREE.MeshBasicMaterial({
+            color:color,
+            transparent:true,
+            opacity:.25,
+            side:THREE.DoubleSide,
+            depthWrite:false
+          })
+        );
+
+        tile.userData=cell;
+        group.add(tile);
+        squares.push(tile);
+
+        const wire=new THREE.LineSegments(
+          new THREE.EdgesGeometry(geometry),
+          new THREE.LineBasicMaterial({
+            color:0xA8E5FF,
+            transparent:true,
+            opacity:.62
+          })
+        );
+
+        group.add(wire);
+      });
+
+      group.rotation.x=-Math.PI/2;
+      scene.add(group);
+
+      scene.add(
+        new THREE.AmbientLight(0xBFD8F5,1.4)
+      );
+
+      const sunlight=new THREE.DirectionalLight(
+        0xF2F5FF,3.1
+      );
+      sunlight.position.set(-5,8,5);
+      scene.add(sunlight);
+
+      const controls=new OrbitControls(
         camera,renderer.domElement
       );
 
       controls.enableDamping=true;
       controls.enablePan=false;
-      controls.minDistance=2.0;
-      controls.maxDistance=13.0;
-      controls.maxPolarAngle=Math.PI/2.1;
+      controls.minDistance=2.5;
+      controls.maxDistance=19;
+      controls.target.set(0,0,0);
+
+      const raycaster=new THREE.Raycaster();
+      const mouse=new THREE.Vector2();
+
+      renderer.domElement.addEventListener(
+        "pointerdown",event=>{
+          const rect=
+            renderer.domElement.getBoundingClientRect();
+
+          mouse.x=(
+            (event.clientX-rect.left)/rect.width
+          )*2-1;
+
+          mouse.y=-(
+            (event.clientY-rect.top)/rect.height
+          )*2+1;
+
+          raycaster.setFromCamera(mouse,camera);
+
+          const hits=raycaster.intersectObjects(
+            squares,false
+          );
+
+          if(hits.length){
+            const c=hits[0].object.userData;
+
+            const measured=c.value===null
+              ? "Not available"
+              : c.value+"°";
+
+            detail.innerHTML=
+              "<b>GRID CELL "+c.id+"</b><br>"+
+              "Slope (90th percentile): "+measured+
+              "<br>Coverage: "+c.coverage+"%"+
+              "<br><small>Screening: "+
+              c.status+
+              " — not a safe-landing verdict</small>";
+          }
+        }
+      );
 
       function resize(){
-        const w=root.clientWidth || 800;
-        renderer.setSize(w,540);
-        camera.aspect=w/540;
+        const w=host.clientWidth||850;
+        renderer.setSize(w,560);
+        camera.aspect=w/560;
         camera.updateProjectionMatrix();
       }
-
       window.addEventListener("resize",resize);
       resize();
 
       function animate(){
         requestAnimationFrame(animate);
-        beam.position.z=
-          -6 + (performance.now()%4500)/4500*12;
         controls.update();
         renderer.render(scene,camera);
       }
@@ -954,23 +1306,25 @@ def show_lander_camera(z):
     </html>
     """
 
-    code = code.replace(
-        "__HEIGHTS__",
-        json.dumps(data)
+    scene_html = (
+        scene_html
+        .replace("__HEIGHTS__", json.dumps(data))
+        .replace("__CELLS__", json.dumps(cells))
+        .replace("__SOURCE__", source_label)
     )
 
     components.html(
-        code,
-        height=545,
+        scene_html,
+        height=565,
         scrolling=False
     )
 
 
-# =====================================================
-# NASA HORIZONS — SUN AND EARTH
-# =====================================================
+# ==================================================
+# NASA HORIZONS
+# ==================================================
 
-@st.cache_data(ttl=21600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_horizons(body, lat, lon, start_text, hours):
     start = datetime.strptime(
         start_text, "%Y-%m-%d %H:%M"
@@ -996,28 +1350,32 @@ def get_horizons(body, lat, lon, start_text, hours):
         "APPARENT": "'AIRLESS'"
     }
 
-    response = requests.get(
-        API, params=params, timeout=60
+    r = requests.get(
+        HORIZONS,
+        params=params,
+        timeout=60
     )
+    r.raise_for_status()
 
-    response.raise_for_status()
+    text = r.json()["result"]
 
-    result = response.json()["result"]
-
-    if "$$SOE" not in result:
+    if "$$SOE" not in text or "$$EOE" not in text:
         raise ValueError(
-            "NASA returned no data: " + result[:300]
+            text[:350]
         )
 
     block = (
-        result.split("$$SOE",1)[1]
-        .split("$$EOE",1)[0]
+        text.split("$$SOE", 1)[1]
+        .split("$$EOE", 1)[0]
     )
 
     rows = []
 
     for line in block.splitlines():
-        p = [x.strip() for x in line.split(",")]
+        p = [
+            item.strip()
+            for item in line.split(",")
+        ]
 
         if len(p) < 5:
             continue
@@ -1028,16 +1386,21 @@ def get_horizons(body, lat, lon, start_text, hours):
                     p[0],
                     format="%Y-%b-%d %H:%M"
                 ),
-                "azimuth": float(p[3]),
-                "elevation": float(p[4])
+                "az": float(p[3]),
+                "el": float(p[4])
             })
         except ValueError:
             continue
 
+    if not rows:
+        raise ValueError(
+            "No numeric records received"
+        )
+
     return pd.DataFrame(rows)
 
 
-def analyze(lat, lon, start, hours):
+def mission_data(lat, lon, start, hours):
     text = start.strftime("%Y-%m-%d %H:%M")
 
     sun = get_horizons(
@@ -1048,29 +1411,27 @@ def analyze(lat, lon, start, hours):
         "399", lat, lon, text, hours
     )
 
-    df = sun[
-        ["time","elevation"]
-    ].merge(
-        earth[["time","elevation"]],
+    df = sun[["time", "el"]].merge(
+        earth[["time", "el"]],
         on="time",
-        suffixes=("_sun","_earth")
+        suffixes=("_sun", "_earth")
     ).sort_values("time")
 
     df = df.iloc[:-1].copy()
 
     if len(df) != hours:
         raise ValueError(
-            "Incomplete hourly ephemeris."
+            "Incomplete hourly NASA data"
         )
 
-    df["Sun"] = df.elevation_sun > 0
-    df["Earth"] = df.elevation_earth > 0
+    df["Sun"] = df.el_sun > 0
+    df["Earth"] = df.el_earth > 0
     df["Both"] = df.Sun & df.Earth
 
     return df
 
 
-def metrics(df):
+def mission_numbers(df):
     return {
         "Sun": int(df.Sun.sum()),
         "Earth": int(df.Earth.sum()),
@@ -1078,37 +1439,71 @@ def metrics(df):
     }
 
 
-def visibility_chart(df):
+def draw_visibility(df):
+    numbers = mission_numbers(df)
+
+    a, b, c = st.columns(3)
+
+    a.metric(
+        tr("sun"),
+        f"{numbers['Sun']} h"
+    )
+
+    b.metric(
+        tr("earth"),
+        f"{numbers['Earth']} h"
+    )
+
+    c.metric(
+        tr("both"),
+        f"{numbers['Both']} h"
+    )
+
+    if numbers["Earth"] == 0:
+        st.info(tr("no_earth"))
+
     fig = go.Figure()
 
-    for name, column, color in [
-        ("Sun","elevation_sun","#ffce73"),
-        ("Earth","elevation_earth","#75c5ff")
-    ]:
-        fig.add_trace(go.Scatter(
-            x=df.time,
-            y=df[column],
-            name=name,
-            mode="lines",
-            line=dict(
-                color=color,
-                width=3
-            )
-        ))
+    fig.add_trace(go.Scatter(
+        x=df.time,
+        y=df.el_sun,
+        name="Sun",
+        line=dict(
+            color="#F1CE8C",
+            width=3
+        )
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=df.time,
+        y=df.el_earth,
+        name="Earth",
+        line=dict(
+            color="#76C5F5",
+            width=3
+        )
+    ))
 
     fig.add_hline(
         y=0,
         line_dash="dash",
-        line_color="#e77a88"
+        line_color="#C8D4E4"
     )
 
     fig.update_layout(
-        title="Sun and Earth above the horizon",
+        title=tr("horizon"),
         template="plotly_dark",
-        xaxis_title="Time (UTC)",
-        yaxis_title="Elevation (degrees)",
-        height=410,
-        hovermode="x unified"
+        paper_bgcolor="#091625",
+        plot_bgcolor="#091625",
+        font=dict(color="#DCECF7"),
+        xaxis_title="UTC",
+        yaxis_title=(
+            "الارتفاع بالدرجات"
+            if is_ar()
+            else "Elevation (degrees)"
+        ),
+        hovermode="x unified",
+        height=400
     )
 
     st.plotly_chart(
@@ -1116,475 +1511,436 @@ def visibility_chart(df):
         use_container_width=True
     )
 
+    st.caption(tr("visibility_note"))
 
-# =====================================================
-# NAVIGATION
-# =====================================================
 
-with st.sidebar:
-    st.markdown("## أُفُق | OFOQ")
-    st.caption("LUNAR MISSION CONTROL")
+# ==================================================
+# PAGE: EXPLORE
+# ==================================================
 
-    section = st.radio(
-        "Navigation",
-        [
-            "01 — Explore & Choose",
-            "02 — Terrain Scanner",
-            "03 — Lander Camera",
-            "04 — Sun & Earth",
-            "05 — Mission Plan B",
-            "06 — Science & Sources"
-        ]
+if page == "explore":
+    st.header(tr("explore"))
+
+    view = st.segmented_control(
+        tr("view"),
+        ["2D", "3D"],
+        default="2D",
+        key="view_mode"
     )
 
-    st.divider()
+    if view == "3D":
+        try:
+            moon_3d()
+        except Exception as error:
+            st.error(str(error))
 
-    st.caption("YOUR SELECTED LOCATION")
-
-    st.write(
-        f"Latitude: **{st.session_state.lat:.5f}°**"
-    )
-
-    st.write(
-        f"Longitude: **{st.session_state.lon:.5f}°**"
-    )
-
-    st.divider()
-
-    selected_date = st.date_input(
-        "Mission date (UTC)",
-        value=date(2026,11,14)
-    )
-
-    hours = st.slider(
-        "Mission duration (hours)",
-        24,96,48,12
-    )
-
-# =====================================================
-# SECTION 1: EXPLORATION AND SITE SELECTION
-# =====================================================
-
-if section == "01 — Explore & Choose":
-    st.header("Explore the Moon")
-
-    st.write(
-        "Choose 2D to select a landing point "
-        "by clicking directly on the map. "
-        "Choose 3D to rotate and explore the Moon."
-    )
-
-    mode = st.radio(
-        "View mode",
-        ["2D Map — Select Point", "3D Moon — Explore"],
-        horizontal=True
-    )
-
-    if mode.startswith("2D"):
-        st.subheader("Click where you want to investigate")
-
-        show_clickable_map()
-
-        st.caption(
-            "The map is restricted to the lunar "
-            "south-pole region. Positions are "
-            "investigation points, not approved "
-            "landing locations."
+        st.info(
+            "للاختيار الدقيق اضغط على وضع 2D."
+            if is_ar()
+            else "Use 2D mode to select a precise location."
         )
 
     else:
         try:
-            show_3d_moon()
+            moon_2d()
         except Exception as error:
-            st.error(str(error))
-
-        st.info(
-            "The 3D globe is for visual exploration. "
-            "Switch to 2D to click and save "
-            "your exact investigation point."
-        )
-
-# =====================================================
-# SECTION 2: REGIONAL TERRAIN SCANNER
-# =====================================================
-
-elif section == "02 — Terrain Scanner":
-    st.header("Regional Terrain Scanner")
-
-    st.write(
-        "OFOQ automatically loads NASA LOLA "
-        "global elevation data and examines "
-        "the region around your selected point."
-    )
-
-    st.warning(
-        "This is a REGIONAL elevation scan, "
-        "not a certified landing-hazard scan. "
-        "Small rocks, craters, and slopes may "
-        "not be resolved by this DEM."
-    )
-
-    try:
-        with st.spinner(
-            "Loading NASA lunar elevation data..."
-        ):
-            axis, z, ppd = sample_lunar_terrain(
-                st.session_state.lat,
-                st.session_state.lon
+            st.error(
+                tr("error") + ": " + str(error)
             )
 
-        st.success(
-            f"NASA terrain data loaded: "
-            f"{ppd} pixels per degree."
-        )
 
-        cells = create_scan_cells(z)
+# ==================================================
+# PAGE: LANDER CAMERA + SCAN
+# ==================================================
 
-        show_scanner(cells)
+elif page == "surface":
+    st.header(tr("surface_title"))
 
-        c1,c2,c3 = st.columns(3)
+    st.write(tr("surface_description"))
+    selected_position_card()
 
-        c1.metric(
-            "Minimum elevation",
-            f"{np.nanmin(z):.0f} m"
-        )
-
-        c2.metric(
-            "Maximum elevation",
-            f"{np.nanmax(z):.0f} m"
-        )
-
-        c3.metric(
-            "Regional relief",
-            f"{np.nanmax(z)-np.nanmin(z):.0f} m"
-        )
-
-        st.info(
-            "Blue shades describe relative "
-            "elevation only. They are NOT "
-            "landing-safety scores."
-        )
-
-        st.download_button(
-            "Download measured regional grid",
-            data=pd.DataFrame(
-                cells
-            ).to_csv(index=False),
-            file_name="OFOQ_terrain.csv",
-            mime="text/csv"
-        )
-
-    except Exception as error:
-        st.error(
-            "NASA elevation model unavailable."
-        )
-        st.code(str(error))
-
-# =====================================================
-# SECTION 3: LANDER CAMERA
-# =====================================================
-
-elif section == "03 — Lander Camera":
-    st.header("Virtual Lander Camera")
-
-    st.write(
-        "This view looks across reconstructed "
-        "lunar terrain, instead of showing "
-        "another overhead map."
-    )
-
-    st.info(
-        "The landscape is a visual simulation "
-        "based on NASA elevations. "
-        "It is NOT real lander camera footage. "
-        "Terrain height is exaggerated."
-    )
-
-    try:
-        with st.spinner(
-            "Building virtual terrain..."
-        ):
-            axis, z, ppd = sample_lunar_terrain(
-                st.session_state.lat,
-                st.session_state.lon
-            )
-
-        show_lander_camera(z)
-
-        st.caption(
-            "Source: NASA LOLA global DEM. "
-            "This model has regional-scale detail "
-            "only; it cannot show individual "
-            "small rocks or certify landing safety."
-        )
-
-    except Exception as error:
-        st.error(
-            "Virtual terrain could not load."
-        )
-        st.code(str(error))
-
-# =====================================================
-# SECTION 4: MISSION WINDOWS
-# =====================================================
-
-elif section == "04 — Sun & Earth":
-    st.header("Can the lander see the Sun and Earth?")
-
-    st.write(
-        "The Sun affects lighting and possible "
-        "solar power. Earth visibility affects "
-        "whether direct communication may be possible."
-    )
+    if st.session_state.lat > -80:
+        st.warning(tr("south_warning"))
 
     if st.button(
-        "Analyze NASA mission conditions",
+        tr("scan_button"),
         type="primary"
     ):
-        start = datetime.combine(
-            selected_date, time(0,0)
+        st.session_state[
+            "scan_requested"
+        ] = (
+            st.session_state.lat,
+            st.session_state.lon
         )
 
-        try:
-            with st.spinner(
-                "Reading NASA JPL Horizons..."
-            ):
-                df = analyze(
-                    st.session_state.lat,
-                    st.session_state.lon,
-                    start,
-                    hours
-                )
-
-            st.session_state.visibility_result = (
-                df,
-                (
-                    st.session_state.lat,
-                    st.session_state.lon,
-                    selected_date,
-                    hours
-                )
-            )
-
-        except Exception as error:
-            st.error(str(error))
-
-    result = st.session_state.visibility_result
+    requested = st.session_state.get(
+        "scan_requested"
+    )
 
     current = (
         st.session_state.lat,
+        st.session_state.lon
+    )
+
+    if requested == current:
+        dem = None
+        cells = None
+        high_resolution = False
+        source_label = "NASA LOLA"
+
+        if st.session_state.lat <= -80:
+            try:
+                with st.spinner(
+                    "NASA LOLA / Terrain Data"
+                ):
+                    dem, slope, pixel = get_polar_scan(
+                        *current
+                    )
+
+                cells = make_cells(slope)
+                high_resolution = True
+
+                source_label = (
+                    f"NASA LOLA COG | {pixel:.0f} m/pixel"
+                )
+
+            except Exception:
+                st.warning(tr("scan_unavailable"))
+
+        if dem is None:
+            try:
+                dem = coarse_virtual_terrain(
+                    *current
+                )
+
+                source_label = (
+                    "NASA LOLA global DEM — "
+                    "regional visual only"
+                )
+            except Exception as error:
+                st.error(
+                    tr("error") + ": " + str(error)
+                )
+
+        if dem is not None:
+            if cells is None:
+                cells = [
+                    {
+                        "id": f"{r + 1}-{c + 1}",
+                        "value": None,
+                        "status": "unknown",
+                        "coverage": 0
+                    }
+                    for r in range(8)
+                    for c in range(8)
+                ]
+
+            render_lander_scene(
+                dem,
+                cells,
+                source_label
+            )
+
+            st.caption(tr("camera_note"))
+            st.info(tr("scan_limit"))
+
+            if high_resolution:
+                st.success(tr("scan_loaded"))
+
+                valid = [
+                    c for c in cells
+                    if c["value"] is not None
+                ]
+
+                if valid:
+                    best = min(
+                        valid,
+                        key=lambda c: c["value"]
+                    )
+
+                    if is_ar():
+                        st.write(
+                            "**أقل ميل مقاس في الشبكة:** "
+                            f"الخلية {best['id']} "
+                            f"({best['value']}°). "
+                            "هذا لا يعني أنها آمنة للهبوط."
+                        )
+                    else:
+                        st.write(
+                            "**Lowest measured screening slope:** "
+                            f"Cell {best['id']} "
+                            f"({best['value']}°). "
+                            "This does not certify landing safety."
+                        )
+
+                st.download_button(
+                    "تحميل نتائج المسح"
+                    if is_ar()
+                    else "Download Scan Data",
+                    pd.DataFrame(cells).to_csv(
+                        index=False
+                    ),
+                    file_name="OFOQ_terrain_scan.csv",
+                    mime="text/csv"
+                )
+
+
+# ==================================================
+# PAGE: SUN AND EARTH
+# ==================================================
+
+elif page == "visibility":
+    st.header(tr("visibility"))
+
+    selected_position_card()
+
+    mission_date = st.date_input(
+        tr("mission_date"),
+        value=date(2026, 11, 14),
+        key="mission_date"
+    )
+
+    duration = st.slider(
+        tr("duration"),
+        min_value=24,
+        max_value=96,
+        value=48,
+        step=12,
+        key="duration"
+    )
+
+    signature = (
+        st.session_state.lat,
         st.session_state.lon,
-        selected_date,
-        hours
+        mission_date,
+        duration
     )
-
-    if result is not None and result[1] == current:
-        df = result[0]
-        values = metrics(df)
-
-        a,b,c = st.columns(3)
-
-        a.metric(
-            "Sun above horizon",
-            f"{values['Sun']} h"
-        )
-
-        b.metric(
-            "Earth above horizon",
-            f"{values['Earth']} h"
-        )
-
-        c.metric(
-            "Both at once",
-            f"{values['Both']} h"
-        )
-
-        visibility_chart(df)
-
-        if values["Both"] == 0:
-            st.warning(
-                "No simultaneous visibility was "
-                "found during the sampled hours."
-            )
-        else:
-            st.success(
-                "This site has approximately "
-                f"{values['Both']} sampled hours "
-                "when both objects are above "
-                "the geometric horizon."
-            )
-
-        st.caption(
-            "Hourly estimates, using a geometric "
-            "horizon. Terrain blocking and actual "
-            "radio-link performance are not modeled."
-        )
-
-    else:
-        st.info(
-            "Select a point on the map, "
-            "then press Analyze."
-        )
-
-# =====================================================
-# SECTION 5: PLAN B
-# =====================================================
-
-elif section == "05 — Mission Plan B":
-    st.header("What if the mission plan changes?")
-
-    comparison = st.radio(
-        "Compare",
-        [
-            "Same location, different date",
-            "Different location, same date"
-        ]
-    )
-
-    start = datetime.combine(
-        selected_date,time(0,0)
-    )
-
-    lat_b = st.session_state.lat
-    lon_b = st.session_state.lon
-    start_b = start
-
-    if comparison.startswith("Same"):
-        delay = st.slider(
-            "Mission delay (hours)",
-            0,168,48,12
-        )
-
-        start_b = (
-            start + timedelta(hours=delay)
-        )
-
-    else:
-        lat_b = st.number_input(
-            "Alternative latitude",
-            -90.0,-75.0,-85.0
-        )
-
-        lon_b = st.number_input(
-            "Alternative longitude",
-            -180.0,180.0,0.0
-        )
 
     if st.button(
-        "Compare both mission plans",
+        tr("calculate"),
         type="primary"
     ):
         try:
             with st.spinner(
-                "Comparing NASA mission data..."
+                "NASA JPL Horizons"
             ):
-                first = analyze(
+                start = datetime.combine(
+                    mission_date,
+                    datetime.min.time()
+                )
+
+                df = mission_data(
                     st.session_state.lat,
                     st.session_state.lon,
-                    start,hours
+                    start,
+                    duration
                 )
 
-                second = analyze(
-                    lat_b,lon_b,
-                    start_b,hours
-                )
-
-            a = metrics(first)
-            b = metrics(second)
-
-            left,right = st.columns(2)
-
-            with left:
-                st.subheader("Original mission")
-                for name,value in a.items():
-                    st.metric(
-                        name,f"{value} hours"
-                    )
-
-            with right:
-                st.subheader("Alternative")
-                for name,value in b.items():
-                    st.metric(
-                        name,
-                        f"{value} hours",
-                        delta=b[name]-a[name]
-                    )
-
-            chart = go.Figure()
-
-            chart.add_trace(go.Bar(
-                name="Original",
-                x=list(a.keys()),
-                y=list(a.values())
-            ))
-
-            chart.add_trace(go.Bar(
-                name="Alternative",
-                x=list(b.keys()),
-                y=list(b.values())
-            ))
-
-            chart.update_layout(
-                template="plotly_dark",
-                barmode="group",
-                title="Visibility comparison",
-                yaxis_title="Sampled hours"
-            )
-
-            st.plotly_chart(
-                chart,use_container_width=True
-            )
-
-            st.caption(
-                "Only one factor changes "
-                "at a time: location or date."
+            st.session_state.last_visibility = (
+                signature, df
             )
 
         except Exception as error:
-            st.error(str(error))
+            st.error(
+                tr("error") + ": " + str(error)
+            )
 
-# =====================================================
-# SECTION 6: SCIENCE AND TRANSPARENCY
-# =====================================================
+    previous = st.session_state.last_visibility
 
-else:
-    st.header("Science Behind OFOQ")
+    if previous and previous[0] == signature:
+        draw_visibility(previous[1])
 
-    st.markdown("""
-### What is real?
 
-**Moon imagery:** NASA LRO / Moon Trek.
+# ==================================================
+# PAGE: COMPARE
+# ==================================================
 
-**Regional terrain heights:** NASA LOLA global DEM.
+elif page == "compare":
+    st.header(tr("compare_title"))
 
-**Sun and Earth positions:** NASA JPL Horizons.
+    selected_position_card()
 
-### What is simulated?
+    mission_date = st.date_input(
+        tr("mission_date"),
+        date(2026, 11, 14),
+        key="compare_date"
+    )
 
-The 3D globe and the lander camera are
-visualizations. They are not live spacecraft video.
+    duration = st.slider(
+        tr("duration"),
+        24, 96, 48, 12,
+        key="compare_duration"
+    )
 
-### What is not established yet?
+    compare_type = st.segmented_control(
+        tr("compare"),
+        ["delay", "location"],
+        format_func=lambda x: (
+            tr("same_site")
+            if x == "delay"
+            else tr("other_site")
+        ),
+        default="delay",
+        key="compare_type"
+    )
 
-The scanner cannot certify a landing site as safe.
+    start_a = datetime.combine(
+        mission_date,
+        datetime.min.time()
+    )
 
-A proper landing hazard assessment needs
-much finer terrain data, boulder detection,
-spacecraft dimensions, slope limits, and
-mission-specific engineering criteria.
+    start_b = start_a
 
-### Official resources
+    lat_b = st.session_state.lat
+    lon_b = st.session_state.lon
 
-- [NASA Moon Trek](https://trek.nasa.gov/moon/)
-- [NASA Horizons](https://ssd.jpl.nasa.gov/horizons/)
-- [NASA CGI Moon Kit](https://svs.gsfc.nasa.gov/4720/)
-- [NASA Polar LOLA Data](https://pgda.gsfc.nasa.gov/products/78/)
-    """)
+    if compare_type == "delay":
+        delay = st.slider(
+            tr("delay"),
+            0, 168, 48, 24
+        )
+
+        start_b += timedelta(
+            hours=delay
+        )
+
+    else:
+        st.caption(
+            "اختر النقطة البديلة من خريطة القمر أولًا "
+            "أو أدخل إحداثياتها هنا للمقارنة."
+            if is_ar()
+            else "Select a backup point on the map "
+            "or enter backup coordinates here."
+        )
+
+        lat_b = st.number_input(
+            tr("latitude"),
+            -90.0, 90.0, -85.0,
+            key="alt_lat"
+        )
+
+        lon_b = st.number_input(
+            tr("longitude"),
+            -180.0, 180.0, 0.0,
+            key="alt_lon"
+        )
+
+    if st.button(
+        tr("compare_button"),
+        type="primary"
+    ):
+        try:
+            with st.spinner("NASA Horizons"):
+                original = mission_data(
+                    st.session_state.lat,
+                    st.session_state.lon,
+                    start_a,
+                    duration
+                )
+
+                alternative = mission_data(
+                    lat_b, lon_b,
+                    start_b, duration
+                )
+
+            first = mission_numbers(original)
+            second = mission_numbers(alternative)
+
+            left, right = st.columns(2)
+
+            with left:
+                st.subheader(tr("original"))
+
+                for k, v in first.items():
+                    st.metric(k, f"{v} h")
+
+            with right:
+                st.subheader(tr("alternative"))
+
+                for k, v in second.items():
+                    st.metric(
+                        k,
+                        f"{v} h",
+                        delta=second[k] - first[k]
+                    )
+
+            fig = go.Figure()
+
+            fig.add_trace(go.Bar(
+                x=list(first.keys()),
+                y=list(first.values()),
+                name=tr("original"),
+                marker_color="#588EB9"
+            ))
+
+            fig.add_trace(go.Bar(
+                x=list(second.keys()),
+                y=list(second.values()),
+                name=tr("alternative"),
+                marker_color="#B9DCEF"
+            ))
+
+            fig.update_layout(
+                template="plotly_dark",
+                paper_bgcolor="#091625",
+                plot_bgcolor="#091625",
+                barmode="group",
+                title=tr("compare_title"),
+                yaxis_title="Hours"
+            )
+
+            st.plotly_chart(
+                fig,
+                use_container_width=True
+            )
+
+            st.caption(tr("visibility_note"))
+
+        except Exception as error:
+            st.error(
+                tr("error") + ": " + str(error)
+            )
+
+
+# ==================================================
+# SOURCES
+# ==================================================
 
 st.divider()
 
+with st.expander(tr("science")):
+    st.markdown(
+        """
+        **NASA Scientific Visualization Studio**
+        — Lunar imagery and global elevation models.
+
+        https://svs.gsfc.nasa.gov/4720/
+
+        **NASA LOLA South Pole COG**
+        — Measured lunar elevation and slope.
+
+        https://pgda.gsfc.nasa.gov/products/90
+
+        **NASA JPL Horizons**
+        — Sun and Earth apparent positions.
+
+        https://ssd-api.jpl.nasa.gov/doc/horizons.html
+
+        **Important limitations**
+
+        - No certified safe-landing prediction.
+        - The 3D lander view is virtual.
+        - Terrain cells use an illustrative
+          5° / 12° screening threshold,
+          not NASA-approved safety limits.
+        - Small boulders may be unresolved.
+        - Horizons estimates use a geometric horizon.
+        - Actual power and radio links are not modeled.
+        """
+    )
+
 st.caption(
-    "OFOQ | NASA Space Apps Challenge 2026 "
-    "— Independent educational and mission "
-    "exploration prototype. Not NASA-certified."
+    "OFOQ | NASA SPACE APPS CHALLENGE 2026 | "
+    "Independent research prototype | "
+    "Not NASA-endorsed"
 )
