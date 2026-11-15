@@ -1,50 +1,49 @@
-import streamlit as st
-import requests
+import base64
+import json
+from datetime import datetime, date, timedelta
+from io import BytesIO
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import rasterio
+import requests
+import streamlit as st
+import streamlit.components.v1 as components
+from PIL import Image, ImageDraw, ImageEnhance
 from pyproj import CRS, Transformer
 from rasterio.windows import Window
-from datetime import datetime, date, timedelta
-from io import BytesIO
-from PIL import Image
-import base64
-
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 # ============================================================
-# OFOQ v7 — LUNAR MISSION EXPLORER
+# OFOQ v8
 # ============================================================
 
 st.set_page_config(
     page_title="OFOQ | أُفُق",
     page_icon="🌙",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-TEXTURE = (
+# ------------------------------------------------------------
+# CONSTANTS
+# ------------------------------------------------------------
+
+NASA_MOON_TEXTURE = (
     "https://svs.gsfc.nasa.gov/vis/a000000/"
     "a004700/a004720/lroc_color_2k.jpg"
 )
 
-# NASA Apollo 17 actual surface panorama.
-# This is NOT the selected south-pole location.
-PANORAMA = (
-    "https://svs.gsfc.nasa.gov/vis/a000000/"
-    "a004300/a004302/panorama_print.jpg"
-)
-
-NASA_SLOPE = (
+NASA_SLOPE_COG = (
     "https://pgda.gsfc.nasa.gov/data/LOLA_20mpp/"
     "LDSM_80S_80MPP_ADJ.TIF"
 )
 
-HORIZONS = "https://ssd.jpl.nasa.gov/api/horizons.api"
+HORIZONS_API = "https://ssd.jpl.nasa.gov/api/horizons.api"
 
-LUNAR_CRS = CRS.from_proj4(
-    "+proj=longlat +a=1737400 +b=1737400 "
-    "+no_defs"
+MOON_GEO_CRS = CRS.from_proj4(
+    "+proj=longlat +a=1737400 +b=1737400 +no_defs"
 )
 
 COLORS = {
@@ -52,1709 +51,1348 @@ COLORS = {
     "navy": "#10243A",
     "ice": "#76C5F5",
     "silver": "#DCECF7",
-    "green": "#39AD84",
-    "orange": "#E5A64B",
-    "red": "#D46A70",
-    "gray": "#657587"
+    "green": "#35B77A",
+    "yellow": "#E3B84E",
+    "red": "#D96868",
+    "gray": "#6D7A8A",
 }
 
-# ============================================================
-# APP STATE
-# ============================================================
+# ------------------------------------------------------------
+# SESSION STATE
+# ------------------------------------------------------------
 
 defaults = {
     "lang": "العربية",
     "page": "explore",
-    "view": "2D",
+    "view_mode": "2D",
     "lat": -89.0,
     "lon": 0.0,
-    "backup": None,
-    "last_pick": None,
-    "scan": None,
-    "visibility": None
+    "backup_site": None,
+    "last_3d_pick_id": None,
+    "scan_result": None,
+    "visibility_result": None,
 }
 
-for key, value in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-
-# ============================================================
+# ------------------------------------------------------------
 # BILINGUAL TEXT
-# ============================================================
+# ------------------------------------------------------------
 
-WORDS = {
+TXT = {
     "explore": ("استكشف القمر", "Explore the Moon"),
-    "scan": ("كاميرا المركبة والمسح", "Lander Camera & Scan"),
+    "scan": ("كاميرا الهبوط وتحليل سطح الموقع", "Lander Camera & Landing Scan"),
     "sun": ("الشمس والاتصال", "Sun & Communication"),
     "compare": ("المقارنة والخطة البديلة", "Compare & Plan B"),
-
-    "choose": (
-        "اضغط على القمر لاختيار المكان الذي تريد دراسته",
-        "Click the Moon to select a location"
-    ),
-    "instructions": (
-        "اضغط لاختيار نقطة، واسحب للتحريك، واستخدم "
-        "عجلة الماوس للتكبير.",
-        "Click to select, drag to move, and scroll to zoom."
-    ),
-    "selected": ("الموقع المختار", "Selected location"),
+    "selected_site": ("الموقع الحالي", "Current site"),
     "lat": ("خط العرض", "Latitude"),
     "lon": ("خط الطول", "Longitude"),
-
-    "scanintro": (
-        "شاهد سطح القمر من منظور مركبة افتراضية، "
-        "وافحص الخلايا لمعرفة خصائص التضاريس.",
-        "Explore a virtual lander perspective and "
-        "inspect cells for terrain information."
+    "save_backup": ("حفظ الموقع كخطة بديلة", "Save as Backup Site"),
+    "choose_site": (
+        "اختر موقعك بالضغط على القمر",
+        "Choose your site by clicking the Moon",
     ),
-    "startscan": ("ابدأ مسح التضاريس", "Start Terrain Scan"),
-    "dataok": (
-        "تم استخراج قياسات الانحدار من NASA.",
-        "NASA slope measurements were retrieved."
+    "explore_note": (
+        "في وضع 2D اختر نقطة مباشرة من الخريطة. "
+        "وفي وضع 3D يمكنك تدوير القمر والضغط على المكان المطلوب.",
+        "In 2D, choose a point directly from the map. "
+        "In 3D, rotate the Moon and click the desired location.",
     ),
-    "datafail": (
-        "لم تتوفر قياسات الانحدار لهذا الموقع. "
-        "ستظهر الخلايا باللون الرمادي.",
-        "Slope measurements are unavailable. "
-        "Cells remain gray."
+    "start_scan": ("ابدأ تحليل الموقع", "Start Site Analysis"),
+    "scan_note": (
+        "يعرض هذا القسم صورة علوية لسطح القمر مع شبكة تقييم للهبوط. "
+        "كل خلية تعرض لونها ورقم تقييمها مباشرة.",
+        "This section shows a top-down lunar surface view with a landing evaluation grid. "
+        "Each cell shows its color and score directly.",
     ),
-    "green": (
-        "انحدار أقل ضمن معايير الفحص الأولي",
-        "Lower slope in preliminary screening"
+    "best_areas": ("أفضل أماكن الهبوط", "Best Landing Areas"),
+    "legend": ("مفتاح الألوان", "Color Legend"),
+    "green": ("مناسب أكثر للهبوط", "More suitable for landing"),
+    "yellow": ("يحتاج حذرًا", "Needs caution"),
+    "red": ("أعلى خطورة", "Higher risk"),
+    "gray": ("بيانات غير كافية", "Insufficient data"),
+    "scan_loaded": ("تم تحليل التضاريس بنجاح", "Terrain analysis completed"),
+    "scan_failed": (
+        "تعذر تحميل بيانات الميل من NASA لهذا الموقع. "
+        "ستظهر الشبكة باللون الرمادي.",
+        "Could not load NASA slope data for this site. "
+        "The grid will appear gray.",
     ),
-    "orange": (
-        "انحدار متوسط يحتاج مراجعة",
-        "Moderate slope — review needed"
-    ),
-    "red": (
-        "انحدار مرتفع نسبيًا",
-        "Relatively steep terrain"
-    ),
-    "gray": (
-        "بيانات غير كافية",
-        "Insufficient data"
-    ),
-
     "date": ("تاريخ المهمة UTC", "Mission date UTC"),
     "duration": ("مدة المهمة بالساعات", "Mission duration in hours"),
-    "calculate": ("احسب ظروف المهمة", "Calculate Mission Conditions"),
-    "sunhours": ("ساعات ظهور الشمس", "Sun visibility"),
-    "earthhours": ("ساعات ظهور الأرض", "Earth visibility"),
-    "bothhours": ("ظهورهما معًا", "Both visible"),
-    "chart": (
-        "كيف يتغير ارتفاع الشمس والأرض؟",
-        "How do Sun and Earth elevations change?"
+    "run_visibility": ("احسب ظروف المهمة", "Calculate Mission Conditions"),
+    "sun_hours": ("ساعات ظهور الشمس", "Sun visibility hours"),
+    "earth_hours": ("ساعات ظهور الأرض", "Earth visibility hours"),
+    "both_hours": ("ظهورهما معًا", "Both visible hours"),
+    "compare_title": (
+        "ماذا يحدث إذا تغيرت الخطة؟",
+        "What happens if the plan changes?",
     ),
-
-    "comparetitle": (
-        "ماذا يحدث إذا تغيرت خطة الهبوط؟",
-        "What if the landing plan changes?"
-    ),
-    "delaymode": (
-        "نفس الموقع، موعد مختلف",
-        "Same site, different date"
-    ),
-    "sitemode": (
-        "موقع آخر، نفس الموعد",
-        "Different site, same date"
-    ),
-    "delay": ("التأخير بالساعات", "Delay in hours"),
-    "runcompare": ("قارن الخطتين", "Compare Plans"),
+    "same_site": ("نفس الموقع، وقت مختلف", "Same site, different time"),
+    "other_site": ("موقع آخر، نفس الوقت", "Different site, same time"),
+    "delay_hours": ("التأخير بالساعات", "Delay in hours"),
+    "run_compare": ("قارن الخطتين", "Compare Plans"),
     "original": ("الخطة الأصلية", "Original Plan"),
     "alternative": ("الخطة البديلة", "Alternative Plan"),
-    "save": ("حفظ الموقع كبديل", "Save as Backup Site"),
-    "sources": ("المصادر والحدود العلمية", "Sources and Limitations"),
+    "sources": ("المصادر والحدود العلمية", "Sources and Scientific Limitations"),
 }
 
+def tr(key):
+    a, b = TXT.get(key, (key, key))
+    return a if st.session_state.lang == "العربية" else b
 
-def t(key):
-    item = WORDS.get(key, (key, key))
-    return item[0] if st.session_state.lang == "العربية" else item[1]
-
-
-def ar():
+def is_ar():
     return st.session_state.lang == "العربية"
 
-
-def select_site(lat, lon):
+def set_site(lat, lon):
     lat = max(-90.0, min(90.0, float(lat)))
-    lon = ((float(lon) + 180) % 360) - 180
+    lon = ((float(lon) + 180.0) % 360.0) - 180.0
 
     st.session_state.lat = round(lat, 5)
     st.session_state.lon = round(lon, 5)
-    st.session_state.scan = None
-    st.session_state.visibility = None
+    st.session_state.scan_result = None
+    st.session_state.visibility_result = None
 
+# ------------------------------------------------------------
+# STYLING
+# ------------------------------------------------------------
 
-# ============================================================
-# NASA IMAGE LOADING
-# ============================================================
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def load_image(url):
-    response = requests.get(url, timeout=40)
-    response.raise_for_status()
-
-    image = Image.open(BytesIO(response.content)).convert("RGB")
-
-    buf = BytesIO()
-    image.save(buf, format="JPEG", quality=88)
-
-    return (
-        "data:image/jpeg;base64,"
-        + base64.b64encode(buf.getvalue()).decode()
-    )
-
-
-# ============================================================
-# VISUAL THEME
-# ============================================================
-
-st.markdown("""
+st.markdown(
+    """
 <style>
 .stApp {
     background:
-      radial-gradient(
-        circle at 80% 0%,
-        #17324A 0%,
-        #081522 40%,
-        #050B16 80%
-      ) !important;
+      radial-gradient(circle at 80% 0%, #18314A 0%, #10243A 34%, #050B16 78%) !important;
     color: #DCECF7;
 }
-
 [data-testid="stHeader"] {
     background: transparent !important;
 }
-
 [data-testid="stSidebar"] {
     background: #081522 !important;
-    border-right: 1px solid #32516C;
+    border-right: 1px solid #294962;
 }
-
 .block-container {
     max-width: 1550px;
-    padding-top: 1.1rem;
+    padding-top: 1rem;
+    padding-bottom: 3rem;
 }
-
-h1, h2, h3, p, label {
-    color: #DCECF7 !important;
+h1, h2, h3, p, label, div {
+    color: #DCECF7;
 }
-
-[data-testid="stSidebar"] [data-testid="stButton"] button {
-    min-height: 66px !important;
-    padding: 13px 17px !important;
-    font-size: 15px !important;
-    font-weight: 700 !important;
-    text-align: start !important;
-}
-
-[data-testid="stButton"] button {
-    background: #10243A !important;
-    color: #DCECF7 !important;
-    border: 1px solid #345A78 !important;
-    border-radius: 14px !important;
-    transition: 0.15s ease;
-}
-
-[data-testid="stButton"] button:hover {
-    border-color: #76C5F5 !important;
-    background: #183954 !important;
-}
-
-[data-testid="stButton"] button[kind="primary"] {
-    background: #76C5F5 !important;
-    color: #050B16 !important;
-}
-
 [data-testid="stMetric"] {
     background: #10243A;
-    border: 1px solid #345A78;
-    padding: 17px;
-    border-radius: 15px;
+    border: 1px solid #375873;
+    border-radius: 16px;
+    padding: 16px;
 }
-
 [data-testid="stMetricValue"] {
     color: #DCECF7;
 }
-
-.ofoq-hero {
-    position: relative;
-    border: 1px solid #3D6481;
-    border-radius: 23px;
-    padding: 30px 36px;
-    margin-bottom: 19px;
+.stButton > button {
+    min-height: 50px;
+    border-radius: 14px !important;
+    background: #10243A !important;
+    color: #DCECF7 !important;
+    border: 1px solid #375873 !important;
+    font-weight: 700 !important;
+}
+.stButton > button:hover {
+    border-color: #76C5F5 !important;
+    background: #17324B !important;
+}
+.stButton > button[kind="primary"] {
+    background: #76C5F5 !important;
+    color: #050B16 !important;
+    border-color: #76C5F5 !important;
+}
+.hero {
+    border: 1px solid #375873;
+    border-radius: 24px;
+    padding: 28px 34px;
+    margin-bottom: 18px;
     background:
-      radial-gradient(
-        circle at 82% 36%,
-        #76C5F533,
-        transparent 28%
-      ),
+      radial-gradient(circle at 78% 34%, rgba(118,197,245,.18), transparent 22%),
       linear-gradient(120deg, #050B16, #10243A);
-    box-shadow: 0 17px 52px #00000050;
+    box-shadow: 0 20px 55px rgba(0,0,0,.35);
 }
-
-.ofoq-hero h1 {
-    font-size: clamp(38px, 5vw, 65px);
-    margin: 7px 0;
+.hero h1 {
+    margin: 8px 0;
+    font-size: clamp(38px, 5vw, 64px);
+    letter-spacing: 2px;
     font-weight: 850;
-    letter-spacing: 3px;
-    text-shadow: 0 0 25px #76C5F52E;
 }
-
-.ofoq-eyebrow {
+.hero .eyebrow {
     color: #76C5F5;
+    font-size: 12px;
     letter-spacing: 2px;
     font-weight: 700;
-    font-size: 12px;
 }
-
-.ofoq-arc {
-    width: 230px;
-    height: 34px;
-    border-top: 2px solid #76C5F5;
-    border-radius: 50% 50% 0 0;
-}
-
-.ofoq-card {
-    padding: 17px;
-    border: 1px solid #345A78;
-    background: #10243A;
-    border-radius: 16px;
-}
-
-.legend {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 15px;
-    padding: 14px;
-    background: #10243A;
-    border: 1px solid #345A78;
-    border-radius: 13px;
-    margin: 12px 0;
-}
-
-.legend span {
+.hero .sub {
     color: #DCECF7;
-    font-size: 13px;
+    opacity: .9;
+    font-size: 16px;
 }
-
-.legend b {
-    display: inline-block;
-    width: 12px;
-    height: 12px;
-    margin-inline-end: 6px;
+.sidebar-title {
+    font-size: 28px;
+    font-weight: 800;
+    margin-bottom: 2px;
+}
+.sidebar-sub {
+    color: #76C5F5;
+    font-size: 12px;
+    letter-spacing: 1px;
+    margin-bottom: 12px;
+}
+.nav-hint {
+    color: #76C5F5;
+    font-size: 12px;
+    letter-spacing: 1px;
+    margin: 10px 0 6px;
+}
+.info-card {
+    background: #10243A;
+    border: 1px solid #375873;
+    border-radius: 16px;
+    padding: 15px 18px;
+}
+.legend-box {
+    background: #10243A;
+    border: 1px solid #375873;
+    border-radius: 16px;
+    padding: 14px 16px;
+}
+.legend-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+.legend-color {
+    width: 14px;
+    height: 14px;
     border-radius: 3px;
 }
-
-hr {
-    border-color: #345A78 !important;
+.best-card {
+    background: #10243A;
+    border: 1px solid #375873;
+    border-radius: 14px;
+    padding: 12px 14px;
+    margin-bottom: 10px;
+}
+.small-note {
+    color: #BFD7E8;
+    font-size: 13px;
+    line-height: 1.8;
 }
 </style>
-""", unsafe_allow_html=True)
-
-
-# ============================================================
-# LARGE SIDE NAVIGATION
-# ============================================================
-
-with st.sidebar:
-    st.markdown("## أُفُق | OFOQ")
-    st.caption("BEYOND THE HORIZON")
-
-    st.selectbox(
-        "Language",
-        ["العربية", "English"],
-        key="lang",
-        label_visibility="collapsed"
-    )
-
-    st.divider()
-
-    sections = [
-        ("explore", "◉", "explore"),
-        ("scan", "▦", "scan"),
-        ("sun", "☼", "sun"),
-        ("compare", "◇", "compare")
-    ]
-
-    for key, symbol, name in sections:
-        if st.button(
-            f"{symbol}  {t(name)}",
-            key=f"nav_{key}",
-            type="primary" if st.session_state.page == key else "secondary",
-            use_container_width=True
-        ):
-            st.session_state.page = key
-            st.rerun()
-
-    st.divider()
-
-    st.caption(t("selected"))
-    st.write(f"**{t('lat')}:** {st.session_state.lat:.5f}°")
-    st.write(f"**{t('lon')}:** {st.session_state.lon:.5f}°")
-
-    if st.button(t("save"), use_container_width=True):
-        st.session_state.backup = (
-            st.session_state.lat,
-            st.session_state.lon
-        )
-        st.success("✓")
-
-
-# ============================================================
-# OFOQ HERO
-# ============================================================
-
-st.markdown(
-    f"""
-    <div class="ofoq-hero"
-         dir="{'rtl' if ar() else 'ltr'}">
-      <div class="ofoq-eyebrow">
-        NASA SPACE APPS CHALLENGE 2026
-      </div>
-      <div class="ofoq-arc"></div>
-      <h1>أُفُق | OFOQ</h1>
-      <div class="ofoq-eyebrow">
-        BEYOND THE HORIZON, TOWARD THE MOON.
-      </div>
-      <p>
-        {"استكشف القمر، واختر موقعًا، وافهم "
-         "ظروف المهمة باستخدام بيانات NASA."
-         if ar()
-         else "Explore the Moon, select a site, "
-              "and understand mission conditions using NASA data."}
-      </p>
-    </div>
-    """,
-    unsafe_allow_html=True
+""",
+    unsafe_allow_html=True,
 )
 
+# ------------------------------------------------------------
+# IMAGE HELPERS
+# ------------------------------------------------------------
 
-# ============================================================
-# ONE MOON VIEWER — EXACTLY ONE CANVAS
-# 2D and 3D are completely separate modes.
-# ============================================================
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_image_from_url(url):
+    response = requests.get(url, timeout=40)
+    response.raise_for_status()
+    image = Image.open(BytesIO(response.content)).convert("RGB")
+    return image
 
-MOON_HTML = """
-<div class="moon-viewer">
-    <div class="moon-stage"></div>
-    <div class="moon-hint"></div>
-</div>
-"""
+def pil_to_data_url(img):
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
-MOON_CSS = """
-.moon-viewer {
-    width: 100%;
-    border: 1px solid #345A78;
-    background: #050B16;
-    border-radius: 17px;
-    overflow: hidden;
-    position: relative;
-}
+# ------------------------------------------------------------
+# MOON 2D MAP
+# ------------------------------------------------------------
 
-.moon-stage {
-    position: relative;
-    width: 100%;
-    min-height: 500px;
-    background: #050B16;
-}
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_global_moon_texture():
+    return load_image_from_url(NASA_MOON_TEXTURE)
 
-.moon-stage canvas {
-    display: block;
-    width: 100%;
-    height: auto;
-    cursor: crosshair;
-    touch-action: none;
-}
+def build_2d_map_with_marker(lat, lon):
+    img = get_global_moon_texture().copy().resize((1200, 600))
+    draw = ImageDraw.Draw(img)
 
-.moon-hint {
-    position: absolute;
-    bottom: 13px;
-    left: 13px;
-    padding: 11px 14px;
-    border-radius: 10px;
-    background: #081522E8;
-    border: 1px solid #345A78;
-    color: #DCECF7;
-    font: 13px Arial;
-    pointer-events: none;
-}
-"""
+    x = int((lon + 180) / 360 * img.width)
+    y = int((90 - lat) / 180 * img.height)
 
-MOON_JS = """
-export default function(component) {
-    const { data, parentElement, setTriggerValue } = component;
+    r = 10
+    draw.ellipse((x-r, y-r, x+r, y+r), outline=COLORS["ice"], width=4)
+    draw.ellipse((x-4, y-4, x+4, y+4), fill="white")
 
-    const stage = parentElement.querySelector(".moon-stage");
-    const hint = parentElement.querySelector(".moon-hint");
+    return img
 
-    // Crucial: remove any old canvas before rendering.
-    stage.replaceChildren();
+# ------------------------------------------------------------
+# 3D MOON PICKER COMPONENT
+# ------------------------------------------------------------
 
-    let disposed = false;
-    let cleanup = () => {};
+HAS_V2 = hasattr(st.components, "v2") and hasattr(st.components.v2, "component")
 
-    hint.textContent = data.ar
-      ? "اضغط للاختيار • اسحب للتحريك • حرّك العجلة للتكبير"
-      : "Click to select • Drag to move • Scroll to zoom";
+if HAS_V2:
+    MOON_3D_HTML = """
+    <div class="moon3d-root">
+      <div class="moon3d-stage"></div>
+      <div class="moon3d-hint"></div>
+    </div>
+    """
 
-    function choose(lat, lon) {
-      lat = Math.max(-90, Math.min(90, lat));
-      lon = ((lon + 180) % 360 + 360) % 360 - 180;
-
-      setTriggerValue("picked", {
-        lat: Number(lat.toFixed(5)),
-        lon: Number(lon.toFixed(5)),
-        id: Date.now() + Math.random()
-      });
+    MOON_3D_CSS = """
+    .moon3d-root {
+      width: 100%;
+      border: 1px solid #375873;
+      border-radius: 16px;
+      overflow: hidden;
+      background: #050B16;
+      position: relative;
     }
+    .moon3d-stage {
+      width: 100%;
+      height: 540px;
+      background: #050B16;
+    }
+    .moon3d-hint {
+      position: absolute;
+      left: 14px;
+      bottom: 14px;
+      background: rgba(8,21,34,.88);
+      border: 1px solid #375873;
+      border-radius: 10px;
+      color: #DCECF7;
+      padding: 10px 12px;
+      font: 13px Arial;
+      z-index: 4;
+    }
+    """
 
-    // =====================================================
-    // 2D VIEW: one NASA image on a single Canvas.
-    // Zoom and drag DO NOT create new images.
-    // =====================================================
+    MOON_3D_JS = """
+    export default function(component) {
+      const { data, parentElement, setTriggerValue } = component;
 
-    if (data.mode === "2D") {
-      const canvas = document.createElement("canvas");
-      canvas.width = 1200;
-      canvas.height = 600;
-      stage.appendChild(canvas);
+      const stage = parentElement.querySelector(".moon3d-stage");
+      const hint = parentElement.querySelector(".moon3d-hint");
+      stage.replaceChildren();
 
-      const ctx = canvas.getContext("2d");
-      const image = new Image();
+      hint.textContent = data.ar
+        ? "اسحب لتدوير القمر واضغط لاختيار الموقع"
+        : "Drag to rotate the Moon and click to choose a location";
 
-      let zoom = 1;
-      let centerX = 1024;
-      let centerY = 512;
-      let down = null;
-      let moved = false;
-
-      function viewport() {
-        const iw = image.naturalWidth;
-        const ih = image.naturalHeight;
-
-        const vw = iw / zoom;
-        const vh = ih / zoom;
-
-        const left = Math.max(
-          0, Math.min(iw-vw, centerX-vw/2)
-        );
-        const top = Math.max(
-          0, Math.min(ih-vh, centerY-vh/2)
-        );
-
-        return {left, top, vw, vh};
-      }
-
-      function paint() {
-        if (!image.naturalWidth) return;
-
-        const v = viewport();
-
-        ctx.clearRect(0,0,1200,600);
-        ctx.fillStyle = "#050B16";
-        ctx.fillRect(0,0,1200,600);
-
-        ctx.drawImage(
-          image,
-          v.left, v.top, v.vw, v.vh,
-          0, 0, 1200, 600
-        );
-
-        const ix = (data.lon+180)/360 * image.width;
-        const iy = (90-data.lat)/180 * image.height;
-
-        const x = (ix-v.left)/v.vw * 1200;
-        const y = (iy-v.top)/v.vh * 600;
-
-        if(x>=0 && x<=1200 && y>=0 && y<=600) {
-          ctx.strokeStyle = "#76C5F5";
-          ctx.fillStyle = "#DCECF7";
-          ctx.lineWidth = 4;
-
-          ctx.beginPath();
-          ctx.arc(x,y,14,0,Math.PI*2);
-          ctx.stroke();
-
-          ctx.beginPath();
-          ctx.arc(x,y,5,0,Math.PI*2);
-          ctx.fill();
-        }
-      }
-
-      image.onload = () => {
-        centerX = (data.lon+180)/360 * image.width;
-        centerY = (90-data.lat)/180 * image.height;
-        paint();
-      };
-
-      image.src = data.texture;
-
-      function point(e) {
-        const r = canvas.getBoundingClientRect();
-        return {
-          x: (e.clientX-r.left)/r.width*1200,
-          y: (e.clientY-r.top)/r.height*600
-        };
-      }
-
-      function start(e) {
-        down = {
-          ...point(e),
-          cx:centerX,
-          cy:centerY
-        };
-
-        moved = false;
-        canvas.setPointerCapture(e.pointerId);
-      }
-
-      function move(e) {
-        if(!down || !image.naturalWidth) return;
-
-        const p = point(e);
-        const dx = p.x-down.x;
-        const dy = p.y-down.y;
-
-        if(Math.hypot(dx,dy)>5) moved=true;
-
-        if(moved) {
-          centerX = down.cx - dx/1200*image.width/zoom;
-          centerY = down.cy - dy/600*image.height/zoom;
-          paint();
-        }
-      }
-
-      function end(e) {
-        if(!down || !image.naturalWidth) return;
-
-        if(!moved) {
-          const p = point(e);
-          const v = viewport();
-
-          const ix = v.left + p.x/1200*v.vw;
-          const iy = v.top + p.y/600*v.vh;
-
-          const lon = ix/image.width*360-180;
-          const lat = 90-iy/image.height*180;
-
-          // Update marker immediately in this canvas.
-          data.lat = lat;
-          data.lon = lon;
-          paint();
-          choose(lat,lon);
-        }
-
-        down = null;
-        moved = false;
-      }
-
-      function wheel(e) {
-        e.preventDefault();
-
-        zoom = Math.max(
-          1, Math.min(8,
-          zoom*(e.deltaY<0?1.2:1/1.2))
-        );
-
-        paint();
-      }
-
-      canvas.addEventListener("pointerdown", start);
-      canvas.addEventListener("pointermove", move);
-      canvas.addEventListener("pointerup", end);
-      canvas.addEventListener("wheel", wheel, {passive:false});
-
-      cleanup = () => {
-        canvas.removeEventListener("pointerdown", start);
-        canvas.removeEventListener("pointermove", move);
-        canvas.removeEventListener("pointerup", end);
-        canvas.removeEventListener("wheel", wheel);
-      };
-
-    } else {
-
-      // ===================================================
-      // 3D VIEW: one genuinely interactive Three.js globe.
-      // ===================================================
+      let disposed = false;
+      let cleanup = () => {};
 
       (async () => {
         try {
-          const THREE = await import(
-            "https://esm.sh/three@0.160.0"
-          );
+          const THREE = await import("https://esm.sh/three@0.160.0");
+          const addon = await import("https://esm.sh/three@0.160.0/examples/jsm/controls/OrbitControls.js");
 
-          const addon = await import(
-            "https://esm.sh/three@0.160.0/examples/jsm/controls/OrbitControls.js"
-          );
-
-          if(disposed) return;
+          if (disposed) return;
 
           const scene = new THREE.Scene();
           scene.background = new THREE.Color(0x050B16);
 
-          const camera = new THREE.PerspectiveCamera(
-            44,1,.1,100
-          );
-          camera.position.set(0,0,4.8);
+          const camera = new THREE.PerspectiveCamera(44, 1, 0.1, 100);
+          camera.position.set(0, 0, 4.9);
 
-          const renderer = new THREE.WebGLRenderer({
-            antialias:true
-          });
-
-          renderer.setPixelRatio(
-            Math.min(devicePixelRatio,2)
-          );
+          const renderer = new THREE.WebGLRenderer({ antialias: true });
+          renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
           stage.appendChild(renderer.domElement);
 
-          const tex = new THREE.TextureLoader().load(
-            data.texture
-          );
-          tex.colorSpace = THREE.SRGBColorSpace;
+          const texture = new THREE.TextureLoader().load(data.texture);
+          texture.colorSpace = THREE.SRGBColorSpace;
 
           const moon = new THREE.Mesh(
-            new THREE.SphereGeometry(1.65,96,64),
-            new THREE.MeshStandardMaterial({
-              map:tex, roughness:1
-            })
+            new THREE.SphereGeometry(1.65, 96, 64),
+            new THREE.MeshStandardMaterial({ map: texture, roughness: 1.0 })
           );
-
           scene.add(moon);
-          scene.add(
-            new THREE.AmbientLight(0xffffff,1.5)
-          );
 
-          const light = new THREE.DirectionalLight(
-            0xDCECF7,2
-          );
-          light.position.set(4,3,6);
+          scene.add(new THREE.AmbientLight(0xffffff, 1.5));
+          const light = new THREE.DirectionalLight(0xffffff, 2.0);
+          light.position.set(4, 3, 6);
           scene.add(light);
 
-          const controls = new addon.OrbitControls(
-            camera,renderer.domElement
-          );
-
+          const controls = new addon.OrbitControls(camera, renderer.domElement);
           controls.enableDamping = true;
           controls.enablePan = false;
           controls.minDistance = 2.1;
           controls.maxDistance = 8;
 
           const marker = new THREE.Mesh(
-            new THREE.SphereGeometry(.045,16,16),
-            new THREE.MeshBasicMaterial({
-              color:0x76C5F5
-            })
+            new THREE.SphereGeometry(0.05, 16, 16),
+            new THREE.MeshBasicMaterial({ color: 0x76C5F5 })
           );
-
-          function updateMarker(lat,lon) {
-            const u = (lon+180)/360;
-            const phi = u*Math.PI*2;
-            const a = lat*Math.PI/180;
-
-            marker.position.set(
-              -1.7*Math.cos(phi)*Math.cos(a),
-               1.7*Math.sin(a),
-               1.7*Math.sin(phi)*Math.cos(a)
-            );
-          }
-
-          updateMarker(data.lat,data.lon);
           scene.add(marker);
 
-          let down = null;
+          function setMarker(lat, lon) {
+            const u = (lon + 180) / 360;
+            const phi = u * Math.PI * 2;
+            const a = lat * Math.PI / 180;
+            marker.position.set(
+              -1.7 * Math.cos(phi) * Math.cos(a),
+               1.7 * Math.sin(a),
+               1.7 * Math.sin(phi) * Math.cos(a)
+            );
+          }
+
+          setMarker(data.lat, data.lon);
+
           const raycaster = new THREE.Raycaster();
           const mouse = new THREE.Vector2();
+          let down = null;
 
-          function pointerDown(e) {
-            down={x:e.clientX,y:e.clientY};
+          function onDown(e) {
+            down = { x: e.clientX, y: e.clientY };
           }
 
-          function pointerUp(e) {
-            if(!down) return;
+          function onUp(e) {
+            if (!down) return;
+            const dist = Math.hypot(e.clientX - down.x, e.clientY - down.y);
+            down = null;
+            if (dist > 6) return;
 
-            const distance = Math.hypot(
-              e.clientX-down.x,
-              e.clientY-down.y
-            );
-            down=null;
+            const rect = renderer.domElement.getBoundingClientRect();
+            mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 
-            if(distance>6) return;
-
-            const rect =
-              renderer.domElement.getBoundingClientRect();
-
-            mouse.x = (
-              (e.clientX-rect.left)/rect.width
-            )*2-1;
-
-            mouse.y = -(
-              (e.clientY-rect.top)/rect.height
-            )*2+1;
-
-            raycaster.setFromCamera(mouse,camera);
+            raycaster.setFromCamera(mouse, camera);
             const hits = raycaster.intersectObject(moon);
 
-            if(!hits.length || !hits[0].uv) return;
+            if (!hits.length || !hits[0].uv) return;
 
             const uv = hits[0].uv;
-            const lon = uv.x*360-180;
-            const lat = uv.y*180-90;
+            const lon = uv.x * 360 - 180;
+            const lat = uv.y * 180 - 90;
 
-            updateMarker(lat,lon);
-            choose(lat,lon);
+            setMarker(lat, lon);
+
+            setTriggerValue("picked", {
+              lat: Number(lat.toFixed(5)),
+              lon: Number(lon.toFixed(5)),
+              pick_id: Date.now() + Math.random()
+            });
           }
 
-          renderer.domElement.addEventListener(
-            "pointerdown",pointerDown
-          );
-          renderer.domElement.addEventListener(
-            "pointerup",pointerUp
-          );
+          renderer.domElement.addEventListener("pointerdown", onDown);
+          renderer.domElement.addEventListener("pointerup", onUp);
 
           function resize() {
-            const w=stage.clientWidth||900;
-            renderer.setSize(w,520);
-            camera.aspect=w/520;
+            const w = stage.clientWidth || 900;
+            const h = 540;
+            renderer.setSize(w, h);
+            camera.aspect = w / h;
             camera.updateProjectionMatrix();
           }
 
-          const observer=new ResizeObserver(resize);
+          const observer = new ResizeObserver(resize);
           observer.observe(stage);
           resize();
 
-          let frame=null;
-
+          let frame = null;
           function animate() {
-            if(disposed) return;
-            frame=requestAnimationFrame(animate);
+            if (disposed) return;
+            frame = requestAnimationFrame(animate);
             controls.update();
-            renderer.render(scene,camera);
+            renderer.render(scene, camera);
           }
-
           animate();
 
-          cleanup=()=>{
+          cleanup = () => {
             observer.disconnect();
-            if(frame) cancelAnimationFrame(frame);
+            if (frame) cancelAnimationFrame(frame);
             controls.dispose();
             renderer.dispose();
-            tex.dispose();
           };
-
-        } catch(err) {
-          hint.textContent = "3D error: "+String(err);
+        } catch (err) {
+          hint.textContent = "3D Error: " + String(err);
         }
       })();
+
+      return () => {
+        disposed = true;
+        cleanup();
+        stage.replaceChildren();
+      };
     }
+    """
 
-    return ()=>{
-      disposed=true;
-      cleanup();
-      stage.replaceChildren();
-    };
-}
-"""
+    MOON_3D = st.components.v2.component(
+        "ofoq_moon_3d_v8",
+        html=MOON_3D_HTML,
+        css=MOON_3D_CSS,
+        js=MOON_3D_JS,
+    )
+else:
+    MOON_3D = None
 
-MOON_VIEWER = st.components.v2.component(
-    "ofoq_single_moon_viewer_v7",
-    html=MOON_HTML,
-    css=MOON_CSS,
-    js=MOON_JS
-)
+# ------------------------------------------------------------
+# LOCAL SURFACE IMAGE FOR LANDING SCAN
+# ------------------------------------------------------------
 
+def build_local_surface_image(lat, lon, span_deg=8):
+    """
+    Create a realistic top-down local patch from NASA's global moon texture.
+    This is visual context only.
+    """
+    global_img = get_global_moon_texture()
+    W, H = global_img.size
 
-# ============================================================
-# REAL NASA SLOPE DATA — CONDITIONAL
-# ============================================================
+    cx = (lon + 180) / 360 * W
+    cy = (90 - lat) / 180 * H
+
+    crop_w = max(120, int(W * span_deg / 360))
+    crop_h = max(120, int(H * span_deg / 180))
+
+    left = int(max(0, min(W - crop_w, cx - crop_w / 2)))
+    top = int(max(0, min(H - crop_h, cy - crop_h / 2)))
+    right = left + crop_w
+    bottom = top + crop_h
+
+    patch = global_img.crop((left, top, right, bottom)).resize((900, 900), Image.Resampling.LANCZOS)
+
+    # Visual enhancement for more "camera-like" feeling.
+    patch = ImageEnhance.Contrast(patch).enhance(1.2)
+    patch = ImageEnhance.Sharpness(patch).enhance(1.4)
+    patch = ImageEnhance.Color(patch).enhance(0.85)
+
+    return patch
+
+# ------------------------------------------------------------
+# NASA SLOPE WINDOW
+# ------------------------------------------------------------
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_slope(lat,lon):
+def get_slope_window(lat, lon):
     if lat > -80:
-        raise ValueError(
-            "The data covers 80–90° south."
-        )
+        raise ValueError("Polar slope data used here covers 80°S to 90°S.")
 
     with rasterio.Env(
         GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
         GDAL_HTTP_TIMEOUT="20",
-        GDAL_HTTP_MAX_RETRY="1"
+        GDAL_HTTP_MAX_RETRY="1",
     ):
-        with rasterio.open(
-            "/vsicurl/"+NASA_SLOPE
-        ) as src:
-
-            if src.crs is None:
-                raise ValueError("Missing raster CRS")
-
-            transform = Transformer.from_crs(
-                LUNAR_CRS,
-                src.crs,
-                always_xy=True
+        with rasterio.open("/vsicurl/" + NASA_SLOPE_COG) as src:
+            transformer = Transformer.from_crs(
+                MOON_GEO_CRS, src.crs, always_xy=True
             )
 
-            x,y = transform.transform(lon,lat)
-            row,col = src.index(x,y)
+            x, y = transformer.transform(lon, lat)
+            row, col = src.index(x, y)
 
             half = 32
+            if not (half <= row < src.height - half and half <= col < src.width - half):
+                raise ValueError("Selected point is outside the available raster.")
 
-            if not (
-                half<=row<src.height-half
-                and half<=col<src.width-half
-            ):
-                raise ValueError(
-                    "Location outside source image"
-                )
+            window = Window(col - half, row - half, 64, 64)
 
-            window=Window(
-                col-half,
-                row-half,
-                64,64
-            )
+            arr = src.read(1, window=window, masked=True)
+            slope = np.ma.array(arr, dtype=float).filled(np.nan)
 
-            a=src.read(
-                1,
-                window=window,
-                masked=True
-            )
+            if src.nodata is not None:
+                slope[slope == src.nodata] = np.nan
 
-            slope=np.ma.array(
-                a,dtype=float
-            ).filled(np.nan)
+            resolution = max(abs(src.transform.a), abs(src.transform.e))
+            return slope, resolution
 
-            resolution=max(
-                abs(src.transform.a),
-                abs(src.transform.e)
-            )
+# ------------------------------------------------------------
+# CELL SCORING
+# ------------------------------------------------------------
 
-            return slope,resolution
+def cell_id(r, c):
+    return f"{chr(65 + r)}{c + 1}"
 
+def slope_to_score(slope_value):
+    """
+    Convert slope (degrees) to a landing suitability score from 0 to 100.
+    Prototype rule:
+    0 deg slope -> 100
+    20 deg slope -> 0
+    """
+    score = 100 - (slope_value / 20.0) * 100
+    return int(round(max(0, min(100, score))))
 
-def make_scan_cells(slope=None):
-    cells=[]
+def score_to_status(score):
+    if score >= 75:
+        return "green"
+    elif score >= 50:
+        return "yellow"
+    else:
+        return "red"
+
+def reason_text(status, lang_ar=True):
+    if lang_ar:
+        if status == "green":
+            return "سطح أكثر استواءً وميل منخفض"
+        if status == "yellow":
+            return "منطقة متوسطة وتحتاج حذرًا"
+        if status == "red":
+            return "ميل أعلى أو تضاريس أصعب"
+        return "لا توجد بيانات كافية"
+    else:
+        if status == "green":
+            return "Flatter terrain with lower slope"
+        if status == "yellow":
+            return "Moderate area and needs caution"
+        if status == "red":
+            return "Higher slope or rougher terrain"
+        return "Insufficient data"
+
+def build_scan_cells(slope=None):
+    cells = []
 
     for r in range(8):
         for c in range(8):
-            item={
-                "id":f"{r+1}-{c+1}",
-                "status":"unknown",
-                "slope":None,
-                "coverage":0
+            entry = {
+                "id": cell_id(r, c),
+                "row": r,
+                "col": c,
+                "score": None,
+                "status": "gray",
+                "slope_p90": None,
+                "coverage": 0.0,
             }
 
             if slope is not None:
-                block=slope[
-                    r*8:(r+1)*8,
-                    c*8:(c+1)*8
-                ]
+                block = slope[r*8:(r+1)*8, c*8:(c+1)*8]
+                valid = block[np.isfinite(block)]
+                coverage = len(valid) / block.size
+                entry["coverage"] = round(coverage * 100, 1)
 
-                values=block[
-                    np.isfinite(block)
-                ]
+                if coverage >= 0.75:
+                    p90 = float(np.percentile(valid, 90))
+                    score = slope_to_score(p90)
 
-                coverage=len(values)/block.size
-                item["coverage"]=round(
-                    coverage*100,1
-                )
+                    entry["slope_p90"] = round(p90, 2)
+                    entry["score"] = score
+                    entry["status"] = score_to_status(score)
 
-                if coverage>=.75:
-                    value=float(
-                        np.percentile(values,90)
-                    )
-
-                    item["slope"]=round(value,2)
-
-                    if value<=5:
-                        item["status"]="low"
-                    elif value<=12:
-                        item["status"]="medium"
-                    else:
-                        item["status"]="high"
-
-            cells.append(item)
+            cells.append(entry)
 
     return cells
 
+def best_cells(cells, n=5):
+    valid = [c for c in cells if c["score"] is not None]
+    valid = sorted(valid, key=lambda x: x["score"], reverse=True)
+    return valid[:n]
 
-# ============================================================
-# NASA SURFACE PHOTO + ANIMATED SCAN
-# ============================================================
+# ------------------------------------------------------------
+# UNIFIED LANDING SCAN HTML
+# ------------------------------------------------------------
 
-SCANNER_HTML = """
-<div class="scan-root">
-  <div class="scan-scene">
-    <div class="scan-photo"></div>
-    <div class="scan-grid"></div>
-    <div class="scan-beam"></div>
-    <div class="scan-badge"></div>
-    <div class="scan-controls">
-      <button class="scan-left">◀</button>
-      <button class="scan-right">▶</button>
-    </div>
-    <div class="scan-details"></div>
-  </div>
-</div>
-"""
+def render_landing_scan(surface_img, cells, lang_ar=True):
+    image_url = pil_to_data_url(surface_img)
+    cell_json = json.dumps(cells, ensure_ascii=False)
 
-SCANNER_CSS = """
-.scan-scene {
-  height: 535px;
-  position: relative;
-  overflow: hidden;
-  border-radius: 18px;
-  background: #050B16;
-  border: 1px solid #345A78;
-  font-family: Arial,sans-serif;
-}
-
-.scan-photo {
-  position:absolute;
-  inset:0;
-  background-size:auto 100%;
-  background-repeat:no-repeat;
-  background-position:50% center;
-  filter:contrast(1.12) brightness(.83);
-}
-
-.scan-grid {
-  position:absolute;
-  left:17%;
-  right:17%;
-  top:38%;
-  bottom:11%;
-  display:grid;
-  grid-template-columns:repeat(8,1fr);
-  grid-template-rows:repeat(8,1fr);
-  transform:perspective(570px) rotateX(24deg);
-  gap:2px;
-  z-index:3;
-}
-
-.scan-cell {
-  border:1px solid #DCECF7C0;
-  background:rgba(101,117,135,.24);
-  cursor:pointer;
-  font-size:0;
-}
-
-.scan-cell.low {
-  background:rgba(57,173,132,.45);
-}
-
-.scan-cell.medium {
-  background:rgba(229,166,75,.48);
-}
-
-.scan-cell.high {
-  background:rgba(212,106,112,.51);
-}
-
-.scan-cell.unknown {
-  background:rgba(101,117,135,.27);
-}
-
-.scan-cell:hover {
-  outline:2px solid #DCECF7;
-  filter:brightness(1.4);
-}
-
-.scan-beam {
-  position:absolute;
-  left:14%;
-  right:14%;
-  top:38%;
-  height:3px;
-  background:#76C5F5;
-  box-shadow:0 0 25px #76C5F5;
-  z-index:4;
-  pointer-events:none;
-  animation:scanmove 4s linear infinite;
-}
-
-@keyframes scanmove {
-  from {top:38%}
-  to {top:90%}
-}
-
-.scan-badge {
-  position:absolute;
-  left:16px;
-  top:16px;
-  padding:11px 15px;
-  border-radius:10px;
-  background:#081522E8;
-  border:1px solid #345A78;
-  color:#DCECF7;
-  font-size:12px;
-  z-index:7;
-}
-
-.scan-controls {
-  position:absolute;
-  left:16px;
-  bottom:16px;
-  display:flex;
-  gap:8px;
-  z-index:8;
-}
-
-.scan-controls button {
-  width:45px;
-  height:40px;
-  background:#10243A;
-  color:#DCECF7;
-  border:1px solid #76C5F5;
-  border-radius:10px;
-  cursor:pointer;
-}
-
-.scan-details {
-  position:absolute;
-  bottom:16px;
-  right:16px;
-  width:min(350px,46%);
-  padding:14px;
-  line-height:1.7;
-  border-radius:12px;
-  border:1px solid #345A78;
-  background:#081522E8;
-  color:#DCECF7;
-  font-size:13px;
-  z-index:8;
-}
-"""
-
-SCANNER_JS = """
-export default function(component) {
-  const {data,parentElement} = component;
-
-  const scene=parentElement.querySelector(".scan-scene");
-  const photo=scene.querySelector(".scan-photo");
-  const grid=scene.querySelector(".scan-grid");
-  const details=scene.querySelector(".scan-details");
-  const badge=scene.querySelector(".scan-badge");
-
-  // Prevent duplicate cells on subsequent reruns.
-  grid.replaceChildren();
-
-  photo.style.backgroundImage="url("+data.photo+")";
-
-  badge.textContent="OFOQ / LUNAR TERRAIN SCAN";
-
-  let position=50;
-
-  const updatePhoto=()=>{
-    photo.style.backgroundPosition=position+"% center";
-  };
-
-  scene.querySelector(".scan-left").onclick=()=>{
-    position=Math.max(0,position-15);
-    updatePhoto();
-  };
-
-  scene.querySelector(".scan-right").onclick=()=>{
-    position=Math.min(100,position+15);
-    updatePhoto();
-  };
-
-  details.textContent=data.ar
-    ? "اضغط على أي مربع لعرض معلوماته"
-    : "Click any cell to inspect its measurements";
-
-  data.cells.forEach(cell=>{
-    const button=document.createElement("button");
-    button.className="scan-cell "+cell.status;
-    button.title="Cell "+cell.id;
-
-    button.onclick=()=>{
-      const value=cell.slope===null
-        ? (data.ar?"غير متاح":"Unavailable")
-        : cell.slope+"°";
-
-      details.textContent=data.ar
-        ? "الخلية "+cell.id+
-          " | مؤشر الانحدار: "+value+
-          " | البيانات الصالحة: "+cell.coverage+"%"
-        : "Cell "+cell.id+
-          " | Slope P90: "+value+
-          " | Valid coverage: "+cell.coverage+"%";
-    };
-
-    grid.appendChild(button);
-  });
-
-  return ()=>{
-    grid.replaceChildren();
-  };
-}
-"""
-
-SCANNER = st.components.v2.component(
-    "ofoq_surface_scanner_v7",
-    html=SCANNER_HTML,
-    css=SCANNER_CSS,
-    js=SCANNER_JS
-)
-
-
-# ============================================================
-# NASA HORIZONS
-# ============================================================
-
-@st.cache_data(ttl=3600,show_spinner=False)
-def horizons(body,lat,lon,start_text,hours):
-    start=datetime.strptime(
-        start_text,"%Y-%m-%d %H:%M"
+    title_text = "OFOQ / LANDING SCAN" if not lang_ar else "أُفُق / تحليل الهبوط"
+    default_details = (
+        "اضغط على أي خلية لمعرفة سبب التقييم."
+        if lang_ar else
+        "Click any cell to see why it received this score."
     )
-    end=start+timedelta(hours=hours)
 
-    params={
-        "format":"json",
-        "COMMAND":f"'{body}'",
-        "OBJ_DATA":"'NO'",
-        "MAKE_EPHEM":"'YES'",
-        "EPHEM_TYPE":"'OBSERVER'",
-        "CENTER":"'coord@301'",
-        "COORD_TYPE":"'GEODETIC'",
-        "SITE_COORD":f"'{lon},{lat},0'",
-        "START_TIME":f"'{start:%Y-%m-%d %H:%M}'",
-        "STOP_TIME":f"'{end:%Y-%m-%d %H:%M}'",
-        "STEP_SIZE":"'1 h'",
-        "QUANTITIES":"'4'",
-        "CSV_FORMAT":"'YES'",
-        "TIME_TYPE":"'UT'",
-        "APPARENT":"'AIRLESS'"
+    html_code = f"""
+    <div id="ofoq-scan-root">
+      <div class="scan-wrapper">
+        <div class="scan-badge">{title_text}</div>
+        <div class="scan-image" id="scan-image"></div>
+        <div class="scan-grid" id="scan-grid"></div>
+        <div class="scan-beam"></div>
+        <div class="scan-details" id="scan-details">{default_details}</div>
+      </div>
+    </div>
+
+    <style>
+      #ofoq-scan-root * {{
+        box-sizing: border-box;
+        font-family: Arial, sans-serif;
+      }}
+      .scan-wrapper {{
+        position: relative;
+        width: 100%;
+        max-width: 900px;
+        height: 900px;
+        border-radius: 18px;
+        overflow: hidden;
+        border: 1px solid #375873;
+        background: #050B16;
+        box-shadow: 0 18px 45px rgba(0,0,0,.30);
+      }}
+      .scan-image {{
+        position: absolute;
+        inset: 0;
+        background-image:
+          linear-gradient(to bottom, rgba(5,11,22,.18), rgba(5,11,22,.06)),
+          url('{image_url}');
+        background-size: cover;
+        background-position: center center;
+        filter: contrast(1.08) brightness(.96);
+      }}
+      .scan-grid {{
+        position: absolute;
+        inset: 0;
+        display: grid;
+        grid-template-columns: repeat(8, 1fr);
+        grid-template-rows: repeat(8, 1fr);
+        z-index: 3;
+      }}
+      .scan-cell {{
+        border: 1px solid rgba(220,236,247,.5);
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        backdrop-filter: blur(1px);
+        cursor: pointer;
+        font-weight: 700;
+        text-align: center;
+        padding: 4px;
+        line-height: 1.2;
+      }}
+      .scan-cell .id {{
+        font-size: 13px;
+        color: #ffffff;
+        text-shadow: 0 1px 2px rgba(0,0,0,.7);
+      }}
+      .scan-cell .score {{
+        margin-top: 4px;
+        font-size: 18px;
+        color: #ffffff;
+        text-shadow: 0 1px 2px rgba(0,0,0,.7);
+      }}
+      .scan-cell.green {{
+        background: rgba(53,183,122,.42);
+      }}
+      .scan-cell.yellow {{
+        background: rgba(227,184,78,.45);
+      }}
+      .scan-cell.red {{
+        background: rgba(217,104,104,.45);
+      }}
+      .scan-cell.gray {{
+        background: rgba(109,122,138,.32);
+      }}
+      .scan-cell:hover {{
+        outline: 2px solid #DCECF7;
+        z-index: 5;
+      }}
+      .scan-badge {{
+        position: absolute;
+        top: 14px;
+        left: 14px;
+        z-index: 5;
+        background: rgba(8,21,34,.88);
+        color: #DCECF7;
+        border: 1px solid #375873;
+        border-radius: 10px;
+        padding: 10px 14px;
+        font-size: 13px;
+        font-weight: 700;
+      }}
+      .scan-details {{
+        position: absolute;
+        right: 14px;
+        bottom: 14px;
+        z-index: 5;
+        width: min(340px, 44%);
+        background: rgba(8,21,34,.88);
+        color: #DCECF7;
+        border: 1px solid #375873;
+        border-radius: 12px;
+        padding: 14px 15px;
+        font-size: 13px;
+        line-height: 1.7;
+      }}
+      .scan-beam {{
+        position: absolute;
+        left: 0;
+        right: 0;
+        height: 3px;
+        background: rgba(118,197,245,.95);
+        box-shadow: 0 0 18px rgba(118,197,245,.9);
+        animation: scanmove 4.2s linear infinite;
+        z-index: 4;
+      }}
+      @keyframes scanmove {{
+        from {{ top: 0%; }}
+        to {{ top: 100%; }}
+      }}
+    </style>
+
+    <script>
+      const cells = {cell_json};
+      const grid = document.getElementById("scan-grid");
+      const details = document.getElementById("scan-details");
+      const langAr = {str(lang_ar).lower()};
+
+      function reason(status) {{
+        if (langAr) {{
+          if (status === "green") return "سطح أكثر استواءً وميل منخفض";
+          if (status === "yellow") return "منطقة متوسطة وتحتاج حذرًا";
+          if (status === "red") return "ميل أعلى أو تضاريس أصعب";
+          return "لا توجد بيانات كافية";
+        }} else {{
+          if (status === "green") return "Flatter terrain with lower slope";
+          if (status === "yellow") return "Moderate area and needs caution";
+          if (status === "red") return "Higher slope or rougher terrain";
+          return "Insufficient data";
+        }}
+      }}
+
+      cells.forEach(cell => {{
+        const el = document.createElement("div");
+        el.className = "scan-cell " + cell.status;
+
+        const scoreText = cell.score === null ? "--" : String(cell.score);
+
+        el.innerHTML = `
+          <div class="id">${{cell.id}}</div>
+          <div class="score">${{scoreText}}</div>
+        `;
+
+        el.onclick = () => {{
+          const slopeText = cell.slope_p90 === null ? "--" : cell.slope_p90 + "°";
+          const coverageText = cell.coverage + "%";
+          const statusText = cell.status.toUpperCase();
+
+          details.innerHTML = langAr
+            ? `
+              <b>الخلية: ${{cell.id}}</b><br>
+              التقييم: <b>${{scoreText}}</b><br>
+              الميل المرجعي (P90): <b>${{slopeText}}</b><br>
+              نسبة البيانات الصالحة: <b>${{coverageText}}</b><br>
+              السبب: <b>${{reason(cell.status)}}</b>
+            `
+            : `
+              <b>Cell: ${{cell.id}}</b><br>
+              Score: <b>${{scoreText}}</b><br>
+              Reference slope (P90): <b>${{slopeText}}</b><br>
+              Valid data coverage: <b>${{coverageText}}</b><br>
+              Reason: <b>${{reason(cell.status)}}</b>
+            `;
+        }};
+
+        grid.appendChild(el);
+      }});
+    </script>
+    """
+
+    components.html(html_code, height=920, scrolling=False)
+
+# ------------------------------------------------------------
+# HORIZONS HELPERS
+# ------------------------------------------------------------
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_horizons(body_code, lat, lon, start_text, hours):
+    start = datetime.strptime(start_text, "%Y-%m-%d %H:%M")
+    end = start + timedelta(hours=hours)
+
+    params = {
+        "format": "json",
+        "COMMAND": f"'{body_code}'",
+        "OBJ_DATA": "'NO'",
+        "MAKE_EPHEM": "'YES'",
+        "EPHEM_TYPE": "'OBSERVER'",
+        "CENTER": "'coord@301'",
+        "COORD_TYPE": "'GEODETIC'",
+        "SITE_COORD": f"'{lon},{lat},0'",
+        "START_TIME": f"'{start:%Y-%m-%d %H:%M}'",
+        "STOP_TIME": f"'{end:%Y-%m-%d %H:%M}'",
+        "STEP_SIZE": "'1 h'",
+        "QUANTITIES": "'4'",
+        "CSV_FORMAT": "'YES'",
+        "TIME_TYPE": "'UT'",
+        "APPARENT": "'AIRLESS'",
     }
 
-    response=requests.get(
-        HORIZONS,params=params,timeout=60
-    )
+    response = requests.get(HORIZONS_API, params=params, timeout=60)
     response.raise_for_status()
-
-    text=response.json()["result"]
+    text = response.json()["result"]
 
     if "$$SOE" not in text or "$$EOE" not in text:
-        raise ValueError(text[:350])
+        raise ValueError(text[:400])
 
-    block=text.split("$$SOE")[1].split("$$EOE")[0]
-    rows=[]
+    block = text.split("$$SOE")[1].split("$$EOE")[0]
+    rows = []
 
     for line in block.splitlines():
-        parts=[p.strip() for p in line.split(",")]
-
-        if len(parts)<5:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 5:
             continue
 
         try:
-            rows.append({
-                "time":pd.to_datetime(
-                    parts[0],format="%Y-%b-%d %H:%M"
-                ),
-                "elevation":float(parts[4])
-            })
+            rows.append(
+                {
+                    "time": pd.to_datetime(parts[0], format="%Y-%b-%d %H:%M"),
+                    "elevation": float(parts[4]),
+                }
+            )
         except ValueError:
             continue
 
     if not rows:
-        raise ValueError("No numeric ephemeris data")
+        raise ValueError("No valid Horizons records found.")
 
     return pd.DataFrame(rows)
 
+def get_visibility(lat, lon, start_dt, hours):
+    start_text = start_dt.strftime("%Y-%m-%d %H:%M")
 
-def analyze(lat,lon,start,hours):
-    text=start.strftime("%Y-%m-%d %H:%M")
+    sun = fetch_horizons("10", lat, lon, start_text, hours)
+    earth = fetch_horizons("399", lat, lon, start_text, hours)
 
-    sun=horizons("10",lat,lon,text,hours)
-    earth=horizons("399",lat,lon,text,hours)
+    df = sun.merge(earth, on="time", suffixes=("_sun", "_earth")).sort_values("time")
+    df = df.iloc[:-1].copy()
 
-    df=sun.merge(
-        earth,
-        on="time",
-        suffixes=("_sun","_earth")
-    ).sort_values("time")
-
-    df=df.iloc[:-1].copy()
-
-    if len(df)!=hours:
-        raise ValueError(
-            "Incomplete hourly ephemeris"
-        )
-
-    df["Sun"]=df.elevation_sun>0
-    df["Earth"]=df.elevation_earth>0
-    df["Both"]=df.Sun & df.Earth
+    df["Sun"] = df["elevation_sun"] > 0
+    df["Earth"] = df["elevation_earth"] > 0
+    df["Both"] = df["Sun"] & df["Earth"]
 
     return df
 
-
-def metrics(df):
+def visibility_metrics(df):
     return {
-        "Sun":int(df.Sun.sum()),
-        "Earth":int(df.Earth.sum()),
-        "Both":int(df.Both.sum())
+        "Sun": int(df["Sun"].sum()),
+        "Earth": int(df["Earth"].sum()),
+        "Both": int(df["Both"].sum()),
     }
 
+# ------------------------------------------------------------
+# SIDEBAR
+# ------------------------------------------------------------
 
-def show_chart(df):
-    n=metrics(df)
+with st.sidebar:
+    st.markdown('<div class="sidebar-title">أُفُق | OFOQ</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sidebar-sub">BEYOND THE HORIZON</div>', unsafe_allow_html=True)
 
-    a,b,c=st.columns(3)
-    a.metric(t("sunhours"),f"{n['Sun']} h")
-    b.metric(t("earthhours"),f"{n['Earth']} h")
-    c.metric(t("bothhours"),f"{n['Both']} h")
-
-    fig=go.Figure()
-
-    fig.add_trace(go.Scatter(
-        x=df.time,
-        y=df.elevation_sun,
-        name="Sun",
-        line=dict(
-            color="#DCECF7",width=3
-        )
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=df.time,
-        y=df.elevation_earth,
-        name="Earth",
-        line=dict(
-            color="#76C5F5",width=3
-        )
-    ))
-
-    fig.add_hline(
-        y=0,
-        line_dash="dash",
-        line_color="#657587"
+    st.selectbox(
+        "Language",
+        ["العربية", "English"],
+        key="lang",
+        label_visibility="collapsed",
     )
 
-    fig.update_layout(
-        title=t("chart"),
-        template="plotly_dark",
-        paper_bgcolor="#081522",
-        plot_bgcolor="#081522",
-        font=dict(color="#DCECF7"),
-        xaxis_title="UTC",
-        yaxis_title="Elevation (°)",
-        height=410
-    )
+    st.markdown('<div class="nav-hint">MISSION NAVIGATION</div>', unsafe_allow_html=True)
 
-    st.plotly_chart(fig,use_container_width=True)
+    nav_items = [
+        ("explore", "◉ " + tr("explore")),
+        ("scan", "▦ " + tr("scan")),
+        ("sun", "☼ " + tr("sun")),
+        ("compare", "◇ " + tr("compare")),
+    ]
 
+    for key, label in nav_items:
+        if st.button(
+            label,
+            key=f"nav_{key}",
+            type="primary" if st.session_state.page == key else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state.page = key
+            st.rerun()
 
-# ============================================================
+    st.divider()
+
+    st.write(f"**{tr('selected_site')}**")
+    st.write(f"{tr('lat')}: **{st.session_state.lat:.5f}°**")
+    st.write(f"{tr('lon')}: **{st.session_state.lon:.5f}°**")
+
+    if st.button(tr("save_backup"), use_container_width=True):
+        st.session_state.backup_site = (st.session_state.lat, st.session_state.lon)
+        st.success("✓")
+
+# ------------------------------------------------------------
+# HERO
+# ------------------------------------------------------------
+
+st.markdown(
+    f"""
+    <div class="hero" dir="{'rtl' if is_ar() else 'ltr'}">
+      <div class="eyebrow">NASA SPACE APPS CHALLENGE 2026</div>
+      <h1>أُفُق | OFOQ</h1>
+      <div class="eyebrow">BEYOND THE HORIZON, TOWARD THE MOON.</div>
+      <p class="sub">
+        {"استكشف القمر، اختر موقعًا، وحلل ظروف المهمة بصورة واضحة وسهلة."
+         if is_ar() else
+         "Explore the Moon, choose a site, and analyze mission conditions clearly and simply."}
+      </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ------------------------------------------------------------
 # PAGE 1 — EXPLORE
-# ============================================================
+# ------------------------------------------------------------
 
-if st.session_state.page=="explore":
-    st.header(t("explore"))
-    st.write(t("choose"))
-    st.caption(t("instructions"))
+if st.session_state.page == "explore":
+    st.header(tr("explore"))
+    st.write(tr("choose_site"))
+    st.caption(tr("explore_note"))
 
-    a,b=st.columns(2)
+    a, b = st.columns(2)
 
     with a:
         if st.button(
-            "◧  2D MAP",
-            type=(
-                "primary"
-                if st.session_state.view=="2D"
-                else "secondary"
-            ),
-            use_container_width=True
+            "2D MAP",
+            type="primary" if st.session_state.view_mode == "2D" else "secondary",
+            use_container_width=True,
         ):
-            st.session_state.view="2D"
+            st.session_state.view_mode = "2D"
             st.rerun()
 
     with b:
         if st.button(
-            "◉  3D MOON",
-            type=(
-                "primary"
-                if st.session_state.view=="3D"
-                else "secondary"
-            ),
-            use_container_width=True
+            "3D MOON",
+            type="primary" if st.session_state.view_mode == "3D" else "secondary",
+            use_container_width=True,
         ):
-            st.session_state.view="3D"
+            st.session_state.view_mode = "3D"
             st.rerun()
 
-    try:
-        texture=load_image(TEXTURE)
+    if st.session_state.view_mode == "2D":
+        moon_map = build_2d_map_with_marker(st.session_state.lat, st.session_state.lon)
+        click = streamlit_image_coordinates(moon_map, width=1200, key="moon_map_2d")
 
-        result=MOON_VIEWER(
-            data={
-                "mode":st.session_state.view,
-                "texture":texture,
-                "lat":st.session_state.lat,
-                "lon":st.session_state.lon,
-                "ar":ar()
-            },
-            key="ofoq_one_moon",
-            on_picked_change=lambda:None
-        )
+        if click is not None:
+            x = click["x"]
+            y = click["y"]
 
-        point=getattr(result,"picked",None)
+            lon = x / 1200 * 360 - 180
+            lat = 90 - y / 600 * 180
 
-        if point and point.get("id") != st.session_state.last_pick:
-            st.session_state.last_pick=point["id"]
-            select_site(
-                point["lat"],
-                point["lon"]
-            )
+            set_site(lat, lon)
             st.rerun()
 
-    except Exception as error:
-        st.error(str(error))
-
-    left,right=st.columns(2)
-
-    left.metric(
-        t("lat"),f"{st.session_state.lat:.5f}°"
-    )
-    right.metric(
-        t("lon"),f"{st.session_state.lon:.5f}°"
-    )
-
-
-# ============================================================
-# PAGE 2 — COMBINED LANDER CAMERA + SCAN
-# ============================================================
-
-elif st.session_state.page=="scan":
-    st.header(t("scan"))
-    st.write(t("scanintro"))
-
-    signature=(
-        st.session_state.lat,
-        st.session_state.lon
-    )
-
-    if st.button(t("startscan"),type="primary"):
-        try:
-            with st.spinner("NASA LOLA"):
-                slope,resolution=get_slope(
-                    *signature
-                )
-
-            st.session_state.scan={
-                "site":signature,
-                "measured":True,
-                "cells":make_scan_cells(slope),
-                "resolution":resolution
-            }
-
-        except Exception as error:
-            st.session_state.scan={
-                "site":signature,
-                "measured":False,
-                "cells":make_scan_cells(None),
-                "error":str(error)
-            }
-
-    scan=st.session_state.scan
-
-    if scan and scan["site"]==signature:
-        cells=scan["cells"]
     else:
-        cells=make_scan_cells(None)
-
-    try:
-        photo=load_image(PANORAMA)
-
-        SCANNER(
-            data={
-                "photo":photo,
-                "cells":cells,
-                "ar":ar()
-            },
-            key="ofoq_unified_scanner"
-        )
-
-    except Exception as error:
-        st.error(str(error))
-
-    # The legend uses red only for terrain hazard,
-    # never for navigation or selection.
-    st.markdown(
-        f"""
-        <div class="legend">
-          <span><b style="background:#39AD84"></b>{t('green')}</span>
-          <span><b style="background:#E5A64B"></b>{t('orange')}</span>
-          <span><b style="background:#D46A70"></b>{t('red')}</span>
-          <span><b style="background:#657587"></b>{t('gray')}</span>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    st.caption(
-        "الصورة بانوراما حقيقية من موقع Apollo 17، "
-        "وليست صورة للموقع الذي اخترته. أما قيم "
-        "الخلايا فتُحسب من إحداثياتك عند نجاح "
-        "تحميل NASA LOLA. المسح فحص أولي فقط."
-        if ar()
-        else "The panoramic image shows Apollo 17, "
-             "not the selected site. Cell measurements "
-             "refer to your selected coordinates when "
-             "NASA LOLA data is available. "
-             "This is preliminary screening only."
-    )
-
-    if scan and scan["site"]==signature:
-        if scan["measured"]:
-            st.success(t("dataok"))
-
-            st.caption(
-                f"NASA LOLA — {scan['resolution']:.0f} m/pixel"
+        if MOON_3D is not None:
+            texture_url = pil_to_data_url(get_global_moon_texture())
+            result = MOON_3D(
+                data={
+                    "texture": texture_url,
+                    "lat": st.session_state.lat,
+                    "lon": st.session_state.lon,
+                    "ar": is_ar(),
+                },
+                key="moon_3d_component",
+                on_picked_change=lambda: None,
             )
 
-            st.download_button(
-                "Download CSV",
-                pd.DataFrame(cells).to_csv(index=False),
-                file_name="OFOQ_scan.csv",
-                mime="text/csv"
-            )
-        else:
-            st.warning(t("datafail"))
-
-            with st.expander("Technical details"):
-                st.code(scan.get("error",""))
-
-
-# ============================================================
-# PAGE 3 — SUN AND EARTH
-# ============================================================
-
-elif st.session_state.page=="sun":
-    st.header(t("sun"))
-
-    mission_date=st.date_input(
-        t("date"),
-        value=date(2026,11,14)
-    )
-
-    duration=st.number_input(
-        t("duration"),
-        min_value=12,
-        max_value=168,
-        value=48,
-        step=12
-    )
-
-    signature=(
-        st.session_state.lat,
-        st.session_state.lon,
-        mission_date,
-        duration
-    )
-
-    if st.button(t("calculate"),type="primary"):
-        try:
-            start=datetime.combine(
-                mission_date,
-                datetime.min.time()
-            )
-
-            with st.spinner("NASA Horizons"):
-                df=analyze(
-                    st.session_state.lat,
-                    st.session_state.lon,
-                    start,
-                    duration
-                )
-
-            st.session_state.visibility=(
-                signature,df
-            )
-
-        except Exception as error:
-            st.error(str(error))
-
-    saved=st.session_state.visibility
-
-    if saved and saved[0]==signature:
-        show_chart(saved[1])
-
-        st.caption(
-            "تقديرات هندسية لكل ساعة؛ لا تشمل "
-            "حجب الجبال أو كفاءة الاتصال الفعلية."
-            if ar()
-            else "Hourly geometric estimates. "
-                 "Terrain blockage and real "
-                 "communication performance are excluded."
-        )
-
-
-# ============================================================
-# PAGE 4 — COMPARE
-# ============================================================
-
-elif st.session_state.page=="compare":
-    st.header(t("comparetitle"))
-
-    mission_date=st.date_input(
-        t("date"),
-        date(2026,11,14),
-        key="compare_date"
-    )
-
-    duration=st.number_input(
-        t("duration"),
-        12,168,48,12,
-        key="compare_duration"
-    )
-
-    mode=st.selectbox(
-        "Comparison",
-        ["delay","site"],
-        format_func=lambda x:(
-            t("delaymode")
-            if x=="delay"
-            else t("sitemode")
-        )
-    )
-
-    start_a=datetime.combine(
-        mission_date,
-        datetime.min.time()
-    )
-    start_b=start_a
-
-    lat_b=st.session_state.lat
-    lon_b=st.session_state.lon
-
-    if mode=="delay":
-        delay=st.number_input(
-            t("delay"),
-            0,168,48,12
-        )
-        start_b+=timedelta(hours=delay)
-
-    else:
-        if st.session_state.backup:
-            lat_b,lon_b=st.session_state.backup
-            st.info(
-                f"{lat_b:.5f}°, {lon_b:.5f}°"
-            )
+            pick = getattr(result, "picked", None)
+            if pick and pick.get("pick_id") != st.session_state.last_3d_pick_id:
+                st.session_state.last_3d_pick_id = pick["pick_id"]
+                set_site(pick["lat"], pick["lon"])
+                st.rerun()
         else:
             st.warning(
-                "احفظ موقعًا بديلًا من قائمة الاستكشاف."
-                if ar()
-                else "Save a backup site from Explore."
+                "3D selection is not available in this Streamlit version. Use 2D."
+            )
+
+    c1, c2 = st.columns(2)
+    c1.metric(tr("lat"), f"{st.session_state.lat:.5f}°")
+    c2.metric(tr("lon"), f"{st.session_state.lon:.5f}°")
+
+# ------------------------------------------------------------
+# PAGE 2 — LANDER CAMERA & LANDING SCAN
+# ------------------------------------------------------------
+
+elif st.session_state.page == "scan":
+    st.header(tr("scan"))
+    st.write(tr("scan_note"))
+
+    current_signature = (st.session_state.lat, st.session_state.lon)
+
+    if st.button(tr("start_scan"), type="primary"):
+        try:
+            with st.spinner("NASA LOLA"):
+                slope, resolution = get_slope_window(*current_signature)
+            cells = build_scan_cells(slope)
+            st.session_state.scan_result = {
+                "signature": current_signature,
+                "cells": cells,
+                "resolution": resolution,
+                "ok": True,
+            }
+        except Exception as err:
+            cells = build_scan_cells(None)
+            st.session_state.scan_result = {
+                "signature": current_signature,
+                "cells": cells,
+                "ok": False,
+                "error": str(err),
+            }
+
+    scan = st.session_state.scan_result
+    if scan and scan["signature"] == current_signature:
+        cells = scan["cells"]
+    else:
+        cells = build_scan_cells(None)
+
+    surface_img = build_local_surface_image(st.session_state.lat, st.session_state.lon)
+
+    left, right = st.columns([3, 1], gap="large")
+
+    with left:
+        render_landing_scan(surface_img, cells, lang_ar=is_ar())
+
+    with right:
+        st.markdown(
+            f"""
+            <div class="legend-box">
+              <h4 style="margin-top:0;">{tr("legend")}</h4>
+              <div class="legend-row">
+                <div class="legend-color" style="background:{COLORS['green']};"></div>
+                <div>{tr("green")}</div>
+              </div>
+              <div class="legend-row">
+                <div class="legend-color" style="background:{COLORS['yellow']};"></div>
+                <div>{tr("yellow")}</div>
+              </div>
+              <div class="legend-row">
+                <div class="legend-color" style="background:{COLORS['red']};"></div>
+                <div>{tr("red")}</div>
+              </div>
+              <div class="legend-row" style="margin-bottom:0;">
+                <div class="legend-color" style="background:{COLORS['gray']};"></div>
+                <div>{tr("gray")}</div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("### " + tr("best_areas"))
+
+        top_cells = best_cells(cells, n=5)
+        if top_cells:
+            for i, item in enumerate(top_cells, start=1):
+                status_label = {
+                    "green": tr("green"),
+                    "yellow": tr("yellow"),
+                    "red": tr("red"),
+                    "gray": tr("gray"),
+                }.get(item["status"], tr("gray"))
+
+                reason = reason_text(item["status"], lang_ar=is_ar())
+
+                st.markdown(
+                    f"""
+                    <div class="best-card">
+                      <b>#{i} — {item['id']}</b><br>
+                      {"التقييم" if is_ar() else "Score"}: <b>{item['score']}</b><br>
+                      {"الميل P90" if is_ar() else "Slope P90"}: <b>{item['slope_p90']}°</b><br>
+                      {"الحالة" if is_ar() else "Status"}: <b>{status_label}</b><br>
+                      <span class="small-note">{reason}</span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info(tr("gray"))
+
+    if scan and scan["signature"] == current_signature:
+        if scan["ok"]:
+            st.success(tr("scan_loaded"))
+            st.caption(f"NASA LOLA slope raster — {scan['resolution']:.0f} m/pixel")
+        else:
+            st.warning(tr("scan_failed"))
+            with st.expander("Technical details"):
+                st.code(scan.get("error", ""))
+
+    st.caption(
+        "هذا العرض يستخدم صورة محلية من نسيج القمر الخاص بـ NASA لعرض المنطقة بصريًا، "
+        "أما التقييمات اللونية والدرجات فمبنية على بيانات الميل حيثما تتوفر."
+        if is_ar()
+        else
+        "This view uses a local patch from NASA's Moon texture for visual context, "
+        "while the color classes and scores are based on slope data when available."
+    )
+
+# ------------------------------------------------------------
+# PAGE 3 — SUN & COMMUNICATION
+# ------------------------------------------------------------
+
+elif st.session_state.page == "sun":
+    st.header(tr("sun"))
+
+    mission_date = st.date_input(tr("date"), value=date(2026, 11, 15))
+    duration = st.slider(tr("duration"), 24, 96, 48, 12)
+
+    signature = (st.session_state.lat, st.session_state.lon, mission_date, duration)
+
+    if st.button(tr("run_visibility"), type="primary"):
+        try:
+            start_dt = datetime.combine(mission_date, datetime.min.time())
+            with st.spinner("NASA Horizons"):
+                df = get_visibility(st.session_state.lat, st.session_state.lon, start_dt, duration)
+            st.session_state.visibility_result = (signature, df)
+        except Exception as err:
+            st.error(str(err))
+
+    saved = st.session_state.visibility_result
+    if saved and saved[0] == signature:
+        df = saved[1]
+        m = visibility_metrics(df)
+
+        a, b, c = st.columns(3)
+        a.metric(tr("sun_hours"), f"{m['Sun']} h")
+        b.metric(tr("earth_hours"), f"{m['Earth']} h")
+        c.metric(tr("both_hours"), f"{m['Both']} h")
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=df["time"],
+                y=df["elevation_sun"],
+                name="Sun",
+                line=dict(color="#DCECF7", width=3),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=df["time"],
+                y=df["elevation_earth"],
+                name="Earth",
+                line=dict(color="#76C5F5", width=3),
+            )
+        )
+        fig.add_hline(y=0, line_dash="dash", line_color="#6D7A8A")
+        fig.update_layout(
+            template="plotly_dark",
+            paper_bgcolor="#081522",
+            plot_bgcolor="#081522",
+            font=dict(color="#DCECF7"),
+            height=420,
+            xaxis_title="UTC",
+            yaxis_title="Elevation (°)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+# ------------------------------------------------------------
+# PAGE 4 — COMPARE
+# ------------------------------------------------------------
+
+elif st.session_state.page == "compare":
+    st.header(tr("compare_title"))
+
+    mission_date = st.date_input(tr("date"), value=date(2026, 11, 15), key="cmp_date")
+    duration = st.slider(tr("duration"), 24, 96, 48, 12, key="cmp_duration")
+
+    mode = st.radio(
+        "Mode",
+        ["delay", "site"],
+        format_func=lambda x: tr("same_site") if x == "delay" else tr("other_site"),
+        horizontal=True,
+    )
+
+    start_a = datetime.combine(mission_date, datetime.min.time())
+    start_b = start_a
+
+    lat_b = st.session_state.lat
+    lon_b = st.session_state.lon
+
+    if mode == "delay":
+        delay = st.slider(tr("delay_hours"), 0, 168, 48, 24)
+        start_b += timedelta(hours=delay)
+    else:
+        if st.session_state.backup_site is not None:
+            lat_b, lon_b = st.session_state.backup_site
+            st.info(f"{tr('lat')}: {lat_b:.5f}° | {tr('lon')}: {lon_b:.5f}°")
+        else:
+            st.warning(
+                "احفظ أولًا موقعًا بديلًا من صفحة الاستكشاف."
+                if is_ar() else
+                "First save a backup site from the Explore page."
             )
 
     if st.button(
-        t("runcompare"),
+        tr("run_compare"),
         type="primary",
-        disabled=(
-            mode=="site"
-            and st.session_state.backup is None
-        )
+        disabled=(mode == "site" and st.session_state.backup_site is None),
     ):
         try:
             with st.spinner("NASA Horizons"):
-                first=analyze(
-                    st.session_state.lat,
-                    st.session_state.lon,
-                    start_a,duration
+                first = get_visibility(st.session_state.lat, st.session_state.lon, start_a, duration)
+                second = get_visibility(lat_b, lon_b, start_b, duration)
+
+            n1 = visibility_metrics(first)
+            n2 = visibility_metrics(second)
+
+            left, right = st.columns(2)
+
+            with left:
+                st.subheader(tr("original"))
+                for k, v in n1.items():
+                    st.metric(k, f"{v} h")
+
+            with right:
+                st.subheader(tr("alternative"))
+                for k, v in n2.items():
+                    st.metric(k, f"{v} h", delta=v - n1[k])
+
+            fig = go.Figure()
+            fig.add_trace(
+                go.Bar(
+                    x=list(n1.keys()),
+                    y=list(n1.values()),
+                    name=tr("original"),
+                    marker_color="#6D7A8A",
                 )
-
-                second=analyze(
-                    lat_b,lon_b,
-                    start_b,duration
+            )
+            fig.add_trace(
+                go.Bar(
+                    x=list(n2.keys()),
+                    y=list(n2.values()),
+                    name=tr("alternative"),
+                    marker_color="#76C5F5",
                 )
-
-            n1=metrics(first)
-            n2=metrics(second)
-
-            a,b=st.columns(2)
-
-            with a:
-                st.subheader(t("original"))
-                for name,value in n1.items():
-                    st.metric(name,f"{value} h")
-
-            with b:
-                st.subheader(t("alternative"))
-                for name,value in n2.items():
-                    st.metric(
-                        name,
-                        f"{value} h",
-                        delta=value-n1[name]
-                    )
-
-            fig=go.Figure()
-
-            fig.add_trace(go.Bar(
-                x=list(n1),
-                y=list(n1.values()),
-                name=t("original"),
-                marker_color="#657587"
-            ))
-
-            fig.add_trace(go.Bar(
-                x=list(n2),
-                y=list(n2.values()),
-                name=t("alternative"),
-                marker_color="#76C5F5"
-            ))
-
+            )
             fig.update_layout(
                 barmode="group",
                 template="plotly_dark",
                 paper_bgcolor="#081522",
                 plot_bgcolor="#081522",
-                height=360
+                font=dict(color="#DCECF7"),
+                height=360,
             )
+            st.plotly_chart(fig, use_container_width=True)
 
-            st.plotly_chart(
-                fig,use_container_width=True
-            )
+        except Exception as err:
+            st.error(str(err))
 
-        except Exception as error:
-            st.error(str(error))
-
-
-# ============================================================
-# SOURCES AND LIMITATIONS
-# ============================================================
+# ------------------------------------------------------------
+# SOURCES
+# ------------------------------------------------------------
 
 st.divider()
 
-with st.expander(t("sources")):
-    st.markdown("""
-**NASA Scientific Visualization Studio — CGI Moon Kit**
-
+with st.expander(tr("sources")):
+    st.markdown(
+        """
+**NASA Moon texture (visual context)**  
 https://svs.gsfc.nasa.gov/4720/
 
-**NASA Apollo 17 Panorama**
-
-https://svs.gsfc.nasa.gov/4302/
-
-**NASA LOLA South Pole Topography**
-
+**NASA LOLA slope data**  
 https://pgda.gsfc.nasa.gov/products/90
 
-**NASA JPL Horizons**
-
+**NASA JPL Horizons**  
 https://ssd-api.jpl.nasa.gov/doc/horizons.html
 
-**Scientific limitations**
+**Important limitations**
+- The landing scan scores are a prototype suitability indicator.
+- Scores are mainly derived from slope information.
+- Score thresholds used in this prototype:
+  - 75+ = Green
+  - 50–74 = Yellow
+  - below 50 = Red
+- Gray means data were unavailable or insufficient.
+- OFOQ does not certify a real lunar landing.
+"""
+    )
 
-- Scanner colors are preliminary slope-screening categories.
-- 5° and 12° thresholds are OFOQ prototype choices.
-- The Apollo photograph is not the selected site.
-- The grid is a visual overlay, not georegistered to the photograph.
-- Small rocks and craters can be unresolved.
-- Geometric Sun/Earth visibility is not a guarantee of
-  electrical power or radio communication.
-- OFOQ does not certify a safe landing site.
-""")
-
-st.caption(
-    "TEAM OFOQ | NASA SPACE APPS CHALLENGE 2026 | "
-    "INDEPENDENT EDUCATIONAL PROTOTYPE"
-)
+st.caption("TEAM OFOQ | NASA SPACE APPS CHALLENGE 2026")
